@@ -131,7 +131,6 @@ class Glm4MoeAttention(nn.Layer):
 
         self.sequence_parallel = config.sequence_parallel
         self.attention_bias = config.attention_bias
-        self.attn_implementation = config._attn_implementation
         self.fuse_attention_qkv = config.fuse_attention_qkv
         self.gqa_or_mqa = config.num_attention_heads != config.num_key_value_heads
 
@@ -262,7 +261,7 @@ class Glm4MoeAttention(nn.Layer):
             value_states = paddle.concat([past_key_value[1], value_states], axis=1)
         past_key_value = (key_states, value_states) if use_cache else None
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config.attn_impl]
+        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -589,7 +588,7 @@ class Glm4MoePreTrainedModel(PretrainedModel):
     config: Glm4MoeConfig
     config_class = Glm4MoeConfig
     base_model_prefix = "model"
-    transpose_weight_keys = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"]
+    transpose_weight_keys = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     @classmethod
     def _get_tensor_parallel_mappings(cls, config: Glm4MoeConfig, is_split=True):
@@ -634,7 +633,7 @@ class Glm4MoePreTrainedModel(PretrainedModel):
 
         def make_base_actions():
             actions = {
-                "lm_head.weight": partial(fn, is_column=not config.tie_word_embeddings),
+                "lm_head.weight": partial(fn, is_column=False),
                 "model.embed_tokens.weight": partial(fn, is_column=False),
             }
             for layer_idx in range(config.num_hidden_layers):
@@ -1225,6 +1224,7 @@ class Glm4MoeForCausalLMPipe(GeneralModelForCausalLMPipe):
     config_class = Glm4MoeConfig
     _decoder_layer_cls = Glm4MoeDecoderLayer
     _get_tensor_parallel_mappings = Glm4MoeModel._get_tensor_parallel_mappings
+    _get_fuse_or_split_param_mappings = Glm4MoeModel._get_fuse_or_split_param_mappings
     _init_weights = Glm4MoeModel._init_weights
     _keep_in_fp32_modules = Glm4MoeModel._keep_in_fp32_modules
     _tied_weights_keys = ["lm_head.weight"]
