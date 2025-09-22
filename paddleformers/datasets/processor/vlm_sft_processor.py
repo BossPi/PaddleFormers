@@ -46,17 +46,44 @@ if __name__ == "__main__":
     from pprint import pprint
     from paddleformers.datasets.vision_processor import ErnieVisionProcessor
     from paddleformers.datasets.template import Ernie45VLTemplate
+    from paddleformers.transformers import AutoTokenizer
 
     template = Ernie45VLTemplate()
+    tokenizer = AutoTokenizer.from_pretrained(
+        "/root/paddlejob/workspace/env/output/peiziliang/baidu/paddle_internal/ernie-4_5-vl-28b-a3b-bf16-tokenizer",
+        trust_remote_code=True,    
+    )
+    # tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base")
     vision_processor = ErnieVisionProcessor(data_args=None)
     processor = SupervisedDatasetProcessor(
         template=template,
-        tokenizer=None,
+        tokenizer=tokenizer,
         processor=vision_processor,
         data_args=None,
     )
-    dataset = [{"text": "This is a test."}]
+    dataset = []
+    data1 = {
+        "messages": [{"role": "system", "content": "这是system中的内容。"}, 
+                    {"role": "user", "content": "<image>你好呀！"}, 
+                    {"role": "assistant", "content": "您好，很高兴为您服务！"}, 
+                    {"role": "user", "content": "<video>今天天气怎么样？"}, 
+                    {"role": "assistant", "content": "<think>\n这个问题我不会\n</think>\n\n不知道啊"}],
+        "images": ["/root/paddlejob/workspace/env/output/peiziliang/ERNIE/examples/data/DoclingMatix/44/0.png"],
+        "videos": ["/root/paddlejob/workspace/env/output/peiziliang/ERNIE/examples/data/NExTVideo/0008/2403134475.mp4"],
+    }
+    dataset.append(data1)
+    data2 = {
+        "messages": [{"role": "system", "content": "这是system中的内容。"}, 
+                    {"role": "user", "content": "<image>你好呀！"}, 
+                    {"role": "assistant", "content": "您好，很高兴为您服务！"}, 
+                    {"role": "user", "content": "<video>今天天气怎么样？"}, 
+                    {"role": "assistant", "content": "不知道啊"}],
+        "images": ["/root/paddlejob/workspace/env/output/peiziliang/ERNIE/examples/data/DoclingMatix/44/0.png"],
+        "videos": ["/root/paddlejob/workspace/env/output/peiziliang/ERNIE/examples/data/NExTVideo/0008/2403134475.mp4"],
+    }
+    dataset.append(data2)
     print("Input:")
     pprint(dataset)
     print("\nOutput:")
-    pprint(processor.preprocess_dataset(dataset))
+    dataset = processor.preprocess_dataset(dataset)
+    pprint(dataset)

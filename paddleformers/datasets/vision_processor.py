@@ -40,12 +40,12 @@ class ErnieVisionProcessor(VisionProcessor):
     def __call__(self, messages: list[dict], images: list[str], videos: list[str], tokenizer: "PreTrainedTokenizer") -> (dict, dict):
         r"""Process vision input."""
         if len(images) > 0:
-            image_inputs = {"image": images}
+            image_inputs = {"images": images, "token_nums": [10]}
         else:
             image_inputs = {}
 
         if len(videos) > 0:
-            video_inputs = {"video": videos}
+            video_inputs = {"videos": videos, "token_nums": [[5, 5, 5]]}
         else:
             video_inputs = {}
 
