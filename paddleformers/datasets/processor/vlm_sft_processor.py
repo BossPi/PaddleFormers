@@ -25,7 +25,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         images = example.get("images", [])
         videos = example.get("videos", [])
 
-        image_inputs, video_inputs = self.processor(messages=messages, images=images, videos=videos, tokenizer=self.tokenizer)
+        image_inputs, video_inputs = self.processor(images=images, videos=videos)
         model_input = self.template.encode(messages=messages, image_inputs=image_inputs, video_inputs=video_inputs, tokenizer=self.tokenizer)
 
         return model_input
@@ -47,19 +47,23 @@ if __name__ == "__main__":
     from paddleformers.datasets.vision_processor import ErnieVisionProcessor
     from paddleformers.datasets.template import Ernie45VLTemplate
     from paddleformers.transformers import AutoTokenizer
+    from paddleformers.hparams.data_args import DataArguments
 
-    template = Ernie45VLTemplate()
+    data_args = DataArguments()
+    
+    template = Ernie45VLTemplate(data_args=data_args)
     tokenizer = AutoTokenizer.from_pretrained(
         "/root/paddlejob/workspace/env/output/peiziliang/baidu/paddle_internal/ernie-4_5-vl-28b-a3b-bf16-tokenizer",
         trust_remote_code=True,    
     )
     # tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base")
-    vision_processor = ErnieVisionProcessor(data_args=None)
+
+    vision_processor = ErnieVisionProcessor(data_args=data_args)
     processor = SupervisedDatasetProcessor(
         template=template,
         tokenizer=tokenizer,
         processor=vision_processor,
-        data_args=None,
+        data_args=data_args,
     )
     dataset = []
     data1 = {
@@ -86,4 +90,4 @@ if __name__ == "__main__":
     pprint(dataset)
     print("\nOutput:")
     dataset = processor.preprocess_dataset(dataset)
-    pprint(dataset)
+    # pprint(dataset)
