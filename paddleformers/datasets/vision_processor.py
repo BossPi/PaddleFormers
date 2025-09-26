@@ -14,6 +14,7 @@
 
 import io
 import os
+import copy
 import math
 import requests
 import numpy as np
@@ -165,6 +166,11 @@ class ErnieVisionProcessor(VisionProcessor):
             frame_indices = [(x[0] + x[1]) // 2 for x in ranges]
         else:
             raise NotImplementedError
+        # print("frame_indices: ", frame_indices)
+        # if vlen == 1161:
+        #     frame_indices = [7, 22, 37, 52, 67, 82, 97, 112, 127, 142, 157, 172, 187, 202, 217, 232, 247, 262, 277, 292, 307, 322, 337, 352, 367, 382, 397, 412, 427, 442, 457, 472, 487, 502, 517, 532, 547, 562, 577, 592, 607, 622, 637, 652, 667, 682, 697, 712, 727, 742, 757, 772, 787, 802, 817, 832, 847, 862, 877, 892, 907, 922, 937, 952, 967, 982, 997, 1011, 1026, 1041, 1056, 1071, 1086, 1101, 1116, 1131, 1146]
+        # else:
+        #     frame_indices = [7, 22, 37, 52, 67, 82, 97, 112, 127, 142, 157, 172, 187, 202, 217, 232, 247, 262, 277, 292, 307, 322, 337, 352, 367, 382, 397, 412, 427, 442, 457, 472, 487, 502, 517, 532, 547, 562, 577, 592, 607, 622, 637, 652, 667, 682, 697, 712, 727, 742, 757, 772, 787, 802, 817]
 
         frames = []
         try:
@@ -224,11 +230,15 @@ class ErnieVisionProcessor(VisionProcessor):
                 * self.temporal_conv_size
             )
             num_padded_images = roundup - len_frames
-            tmp = []
+            tmp_imgs = []
+            tmp_stamps = []
             for _ in range(num_padded_images):
                 padded_image = copy.deepcopy(frames[-1])
-                tmp.append(padded_image)
-            frames.extend(tmp)
+                padded_stamp = copy.deepcopy(time_stamps[-1])
+                tmp_imgs.append(padded_image)
+                tmp_stamps.append(padded_stamp)
+            frames.extend(tmp_imgs)
+            time_stamps.extend(tmp_stamps)
 
         ret = []
         for frame, timestamp in zip(frames, time_stamps):

@@ -64,3 +64,4 @@ class DataArguments:
         default=56 * 56, metadata={"help": "video adaptiveuse min-pixels"}
     )
     render_timestamp: bool = field(default=False, metadata={"help": "render timestamp"})
+    do_resize: bool = field(default=True, metadata={"help": "whether to resize"})

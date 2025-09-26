@@ -15,9 +15,19 @@
 import re
 import random
 import math
+import os
+import PIL
+import numpy as np
+from pathlib import Path
 from dataclasses import dataclass
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from typing import TYPE_CHECKING, Optional, Union
+from packaging import version
+
+if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
+    PILImageResampling = PIL.Image.Resampling
+else:
+    PILImageResampling = PIL.Image
 
 from typing_extensions import override
 
@@ -42,10 +52,10 @@ class Template:
             if messages[0].get("content", "") == "":
                 raise ValueError('system message cannot be empty')
             use_system = 1
-        role_list = ["assistant", "user"]
+        role_list = ["user", "assistant"]
         for idx in range(use_system, len(messages)):
-            if messages[idx].get("role", "") != role_list[idx % 2]:
-                raise ValueError('message role in idx: {} must be {}'.format(idx, role_list[idx % 2]))
+            if messages[idx].get("role", "") != role_list[(idx + use_system) % 2]:
+                raise ValueError('message role in idx: {} must be {}'.format(idx, role_list[(idx + use_system) % 2]))
         return True
 
 
@@ -54,7 +64,7 @@ class Ernie45VLTemplate(Template):
     ignored_index = -100
     image_placeholder = '<image>'
     video_placeholder = '<video>'
-    IDS_TYPE_FLAG = {"text": 0, "image": 1, "video": 1}
+    IDS_TYPE_FLAG = {"text": 0, "image": 1, "video": 2}
     MAX_RATIO = 200
 
     def __init__(self, data_args: "DataArguments"):
@@ -420,35 +430,235 @@ class Ernie45VLTemplate(Template):
             pass
         return image.convert("RGB")
 
-    def process_images(self, image_inputs: list[dict], add_timestamps: bool = False):
+    def render_frame_timestamp(self, frame: Image, timestamp: float, font_rate: float=0.1) -> Image:
+        """
+        Function, given a frame, render the index in order
+        Logic: render the index to the upper left corner of the image
+        frame: frame, PIL.Image object
+        timestamp: timestamp, in seconds
+        font_rate: the ratio of font size to min(wi, hei)
+        """
+        hours = 0
+        while timestamp >= 3600:
+            hours += 1
+            timestamp -= 3600
+        mins = 0
+        while timestamp >= 60:
+            mins += 1
+            timestamp -= 60
+        time_hours = f"{int(hours):02d}"
+        time_mins = f"{int(mins):02d}"
+        time_secs = f"{timestamp:05.02f}"
+
+        time_stamp = "time: " + time_hours + ":" + time_mins + ":" + time_secs
+
+        cur_directory = Path(__file__).parent.absolute()
+        font_path = os.path.join(cur_directory, "font/Roboto-Regular.ttf")
+
+        draw = ImageDraw.Draw(frame)
+        width, height = frame.size
+        font_size = int(min(width, height) * font_rate)
+        outline_size = int(font_size * 0.1)
+        font = ImageFont.truetype(font_path, font_size)
+        x = 0
+        y = 0
+
+        # Draw a black timestamp with a white border
+        draw.text(
+            (x, y),
+            time_stamp,
+            font=font,
+            fill=(0, 0, 0),
+            stroke_width=outline_size,
+            stroke_fill=(255, 255, 255),
+        )
+
+        return frame
+
+    def process_images(self, image_inputs: list[dict], min_pixels: int, max_pixels: int, add_timestamps: bool = False):
         r"""Process image."""
-        imgs = []
+        images = []
         predetermined_grid_thw = []
         for image_input in image_inputs:
             image = self.convert_to_rgb(image_input)
-        return {"images": [image], "token_nums": [5]}
+
+            if add_timestamps and self.render_timestamp:
+                timestamp = image_input.get("time_stamp", -1)
+                assert (
+                    timestamp >= 0
+                ), f"When render timestamp is true，meta need timestamp, timestamp is : {timestamp}"
+                image = self.render_frame_timestamp(image, timestamp)
+            images.append(np.array(image.convert("RGB")))
+
+            resized_height, resized_width = self.smart_resize(
+                image_input["image_height"],
+                image_input["image_width"],
+                factor=self.patch_size * self.merge_size,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+            grid_height = resized_height // self.patch_size
+            grid_width = resized_width // self.patch_size
+            predetermined_grid_thw.append([grid_height, grid_width])
+        predetermined_grid_thw = np.array(predetermined_grid_thw)
+
+        processed_images = []
+        for img_idx, image in enumerate(images):
+            (resized_height, resized_width) = predetermined_grid_thw[img_idx]
+            resized_height *= self.patch_size
+            resized_width *= self.patch_size
+            image = image.astype("uint8")
+            image = Image.fromarray(image)
+            resized_image = image.resize(
+                (resized_width, resized_height),
+                resample=PILImageResampling.BICUBIC,
+                reducing_gap=None
+            )
+            resized_image = np.array(resized_image)
+            # If the input image channel dimension was of size 1, then it is dropped when converting to a PIL image
+            # so we need to add it back if necessary.
+            resized_image = np.expand_dims(resized_image, axis=-1) if resized_image.ndim == 2 else resized_image
+            resized_image = resized_image.transpose((2, 0, 1))
+
+            processed_images.append(resized_image)
+
+        patches = np.array(processed_images)
+
+        channel = patches.shape[1]  # [time, C, H, W]
+        grid_t = patches.shape[0]
+        grid_h, grid_w = resized_height // self.patch_size, resized_width // self.patch_size
+        patches = patches.reshape(
+            [
+                grid_t,
+                channel,
+                grid_h // self.merge_size,
+                self.merge_size,
+                self.patch_size,
+                grid_w // self.merge_size,
+                self.merge_size,
+                self.patch_size,
+            ]
+        )
+        # [grid_t, grid_h/merge_size, grid_w/merge_size, merge_size, merge_size, C, psz, psz]
+        patches = patches.transpose([0, 2, 5, 3, 6, 1, 4, 7])
+
+        patches = patches.reshape(
+            [grid_t * grid_h * grid_w, channel * self.patch_size * self.patch_size]
+        )  # [grid_t * grid_h * grid_w, C * psz * psz]
+
+        image_grid_thw = (grid_t, grid_h, grid_w)
+
+        return patches, image_grid_thw
 
     def process_vision_info(self, messages: list[dict], image_inputs: list[dict], video_inputs: list[list[dict]], tokenizer: "PreTrainedTokenizer") -> (list[dict], list[list[dict]]):
         r"""Process vision info."""
-        print("before squeezing: ", video_inputs)
         video_inputs, video_max_pixels = self.squeeze_video(
                 messages=messages,
                 image_inputs=image_inputs, 
                 video_inputs=video_inputs,
                 tokenizer=tokenizer,
             )
-        print("after squeezing: ", video_inputs)
+        video_min_pixels = self.video_min_pixels
 
-        final_image_inputs, final_video_inputs = [], []
+        final_image_inputs = {
+            "images": [],
+            "grid_thw": [],
+            "token_nums": [],
+        }
+        final_video_inputs = {
+            "images": [],
+            "grid_thw": [],
+            "token_nums": [],
+        }
         for image_input in image_inputs:
-            _ = self.process_images([image_input])
+            patches, image_grid_thw = self.process_images(
+                [image_input],
+                min_pixels=self.min_pixels,
+                max_pixels=self.max_pixels,
+            )
+            grid_t, grid_h, grid_w = image_grid_thw
+            token_nums = (grid_t * grid_h * grid_w) // (self.spatial_conv_size ** 2)
+            final_image_inputs["images"].append(patches)
+            final_image_inputs["grid_thw"].append(image_grid_thw)
+            final_image_inputs["token_nums"].append(token_nums)
         
         for video_input in video_inputs:
-            _ = self.process_images(video_input, add_timestamps=True)
-        
-        image_inputs = {"images": image_inputs, "token_nums": [10]}
-        video_inputs = {"videos": video_inputs, "token_nums": [[5, 5, 5]]}
-        return image_inputs, video_inputs
+            patches, image_grid_thw = self.process_images(
+                video_input,
+                min_pixels=video_min_pixels,
+                max_pixels=video_max_pixels,
+                add_timestamps=True,
+            )
+            grid_t, grid_h, grid_w = image_grid_thw
+            token_nums = (grid_t * grid_h * grid_w) // (self.spatial_conv_size ** 2) // self.temporal_conv_size
+            final_video_inputs["images"].append(patches)
+            final_video_inputs["grid_thw"].append(image_grid_thw)
+            final_video_inputs["token_nums"].append(token_nums)
+
+        return final_image_inputs, final_video_inputs
+    
+    def position_ids_for_rope_3d(self, input_ids, grid_thw, im_patch_id):
+        position_ids = []
+
+        st = 0
+        for i in range(len(grid_thw)):
+            ed = input_ids.index(im_patch_id, st)
+            t, h, w = (
+                grid_thw[i][0],
+                grid_thw[i][1],
+                grid_thw[i][2],
+            )
+            llm_grid_t, llm_grid_h, llm_grid_w = (
+                t.item() if t.item() == 1 else t.item() // self.temporal_conv_size,
+                h.item() // self.merge_size,
+                w.item() // self.merge_size,
+            )
+            text_len = ed - st
+
+            st_idx = (
+                position_ids[-1].max() + 1
+                if len(position_ids) > 0
+                else 0
+            )
+
+            position_ids.append(
+                np.arange(text_len).reshape([1, -1]).repeat(3, axis=0) + st_idx
+            )
+
+            t_index = np.tile(
+                np.arange(llm_grid_t).reshape([-1, 1]),
+                ([1, llm_grid_h * llm_grid_w]),
+            ).flatten()
+            h_index = np.tile(
+                np.arange(llm_grid_h).reshape([1, -1, 1]),
+                ([llm_grid_t, 1, llm_grid_w]),
+            ).flatten()
+            w_index = np.tile(
+                np.arange(llm_grid_w).reshape([1, 1, -1]),
+                ([llm_grid_t, llm_grid_h, 1]),
+            ).flatten()
+
+            position_ids.append(
+                np.stack([t_index, h_index, w_index]) + text_len + st_idx
+            )
+            st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+
+        if st < len(input_ids):
+            st_idx = (
+                position_ids[-1].max() + 1
+                if len(position_ids) > 0
+                else 0
+            )
+            text_len = len(input_ids) - st
+            position_ids.append(
+                np.arange(text_len).reshape([1, -1]).repeat(3, axis=0) + st_idx
+            )
+        position_ids = np.concatenate(position_ids, axis=1).reshape(
+            [3, -1]
+        )
+        position_ids = position_ids.transpose([1, 0])
+
+        return position_ids
 
     @override
     def encode(self, messages: list[dict], image_inputs: list[dict], video_inputs: list[list[dict]], tokenizer: "PreTrainedTokenizer") -> dict:
@@ -470,6 +680,7 @@ class Ernie45VLTemplate(Template):
         )
 
         input_ids, labels, token_type_ids = [], [], []
+        pixel_values, vision_grid_thws = [], []
         image_id, video_id = 0, 0
 
         self.get_special_tokens(tokenizer)
@@ -477,18 +688,33 @@ class Ernie45VLTemplate(Template):
             if part == self.image_placeholder:
                 added_text = f"Picture {image_id + 1}:" + self.image_start_token + self.im_patch_token * image_inputs["token_nums"][image_id] + self.image_end_token
                 input_id = tokenizer.encode(added_text)
-                token_type_ids.extend([self.IDS_TYPE_FLAG["image"]] * len(input_id))
+                token_type_ids.extend([self.IDS_TYPE_FLAG["text"]] * len(tokenizer.encode(f"Picture {image_id + 1}:")))
+                token_type_ids.extend([self.IDS_TYPE_FLAG["image"]] * len(tokenizer.encode(self.image_start_token)))
+                token_type_ids.extend([self.IDS_TYPE_FLAG["image"]] * len(tokenizer.encode(self.im_patch_token * image_inputs["token_nums"][image_id])))
+                token_type_ids.extend([self.IDS_TYPE_FLAG["image"]] * len(tokenizer.encode(self.image_end_token)))
+                pixel_values.append(image_inputs["images"][image_id])
+                vision_grid_thws.append(image_inputs["grid_thw"][image_id])
                 image_id += 1
             elif part == self.video_placeholder:
-                added_text = f"Video {video_id + 1}:" + self.video_start_token + self.im_patch_token * sum(video_inputs["token_nums"][video_id]) + self.video_end_token
+                added_text = f"Video {video_id + 1}:" + self.video_start_token + self.im_patch_token * video_inputs["token_nums"][video_id] + self.video_end_token
                 input_id = tokenizer.encode(added_text)
-                token_type_ids.extend([self.IDS_TYPE_FLAG["video"]] * len(input_id))
+                token_type_ids.extend([self.IDS_TYPE_FLAG["text"]] * len(tokenizer.encode(f"Video {video_id + 1}:")))
+                token_type_ids.extend([self.IDS_TYPE_FLAG["image"]] * len(tokenizer.encode(self.video_start_token)))
+                token_type_ids.extend([self.IDS_TYPE_FLAG["video"]] * len(tokenizer.encode(self.im_patch_token * video_inputs["token_nums"][video_id])))
+                token_type_ids.extend([self.IDS_TYPE_FLAG["image"]] * len(tokenizer.encode(self.video_end_token)))
+                pixel_values.append(video_inputs["images"][video_id])
+                vision_grid_thws.append(video_inputs["grid_thw"][video_id])
                 video_id += 1
             else:
                 input_id = tokenizer.encode(part)
                 token_type_ids.extend([self.IDS_TYPE_FLAG["text"]] * len(input_id))
             input_ids.extend(input_id)
             labels.extend([self.ignored_index] * len(input_id))
+        
+        pixel_values = np.concatenate(
+            pixel_values, axis=0
+        )
+        vision_grid_thws = np.array(vision_grid_thws)
 
         vocab = tokenizer.get_vocab()
         eos_token_id = vocab[self.eos_token]
@@ -500,13 +726,17 @@ class Ernie45VLTemplate(Template):
         label_id = [eos_token_id if x == sep_token_id else x for x in response_id]
         labels.extend(label_id)
 
+        position_ids = self.position_ids_for_rope_3d(input_ids, vision_grid_thws, tokenizer.encode(self.im_patch_token)[0])
+
+        # print("input_ids: ", input_ids)
+        # print("token_type_ids: ", token_type_ids)
         model_input = {
             "input_ids": input_ids,
+            "images": pixel_values,
             "labels": labels,
             "token_type_ids": token_type_ids,
-            "images": image_inputs,
-            "grid_thw": [],
-            "position_ids": [],
+            "grid_thw": vision_grid_thws,
+            "position_ids": position_ids,
         }
         return model_input
 
