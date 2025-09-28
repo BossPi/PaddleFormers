@@ -111,16 +111,18 @@ if __name__ == "__main__":
                 text = tokenizer.decode(input_ids[-3:-1]).lstrip(">")
                 print(text)
                 ids = int(text) - 1
-                if ids != 16:
-                    continue
+                # if ids != 16:
+                #     continue
                 model_input = processor.preprocess_dataset([json.loads(input_datas[ids])])[0]
 
-                print("model_input['input_ids'][:20]: ", model_input["input_ids"][:20])
-                print("model_input['token_type_ids'][:20]: ", model_input["token_type_ids"][:20])
-                print("data['input_ids'][:20]: ", data["input_ids"][:20])
-                print("data['token_type_ids'][:20]: ", data["token_type_ids"][:20])
-                # for key, value in model_input.items():
-                #     # print(key, " is eqaul: ", value == data[key])
+                # print("model_input['input_ids'][:20]: ", model_input["input_ids"][:20])
+                # print("model_input['token_type_ids'][:20]: ", model_input["token_type_ids"][:20])
+                # print("data['input_ids'][:20]: ", data["input_ids"][:20])
+                # print("data['token_type_ids'][:20]: ", data["token_type_ids"][:20])
+                for key, value in model_input.items():
+                    # print(key, " is eqaul: ", value[:200] == data[key][:200])
+                    print(key, " is eqaul: ", np.array_equal(value[:200], np.array(data[key][:200])))
+
                 #     # print(len(value))
                 #     # print(value[2740:2750])
                 #     print(tokenizer.decode(value[-2000:]))
@@ -141,7 +143,7 @@ if __name__ == "__main__":
                 # print("equal: ", np.array_equal(model_input["images"], images))
                 # print("data['labels'] == model_input['labels']:", data['labels'][-100:] == model_input['labels'][-100:])
                 # print("data['position_ids']: ", data["position_ids"][2000:])
-                print("model_input['position_ids']: ", model_input["position_ids"].tolist()[2000:])
+                # print("model_input['position_ids']: ", model_input["position_ids"].tolist()[2000:])
                 print("-------------------")
                 # break
             except Exception as e:
