@@ -1254,6 +1254,8 @@ def clean_unrelated_safetensors(save_dir):
             to_delete.append(filepath)
         elif filename == "model.safetensors.index.json" and os.path.isfile(filepath):
             to_delete.append(filepath)
+        elif filename == "peft_model.safetensors.index.json" and os.path.isfile(filepath):
+            to_delete.append(filepath)
 
     if to_delete:
         logger.warning(
@@ -2972,6 +2974,10 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                 safetensors=True,
                 offload=load_via_cpu,
             )
+            for v in sharded_state_dict.values():
+                if hasattr(v.local_tensor, "target_tensor"):
+                    del v.local_tensor.target_tensor
+
             return model
 
         if not is_sharded and state_dict is None:

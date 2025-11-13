@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .errors import *
-from .hf_parser import *
-from .parse_config import *
+from .workflow import run_auto_parallel
+
+__all__ = ["run_auto_parallel"]
