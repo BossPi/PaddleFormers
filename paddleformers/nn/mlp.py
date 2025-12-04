@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import paddle
 import paddle.nn as nn
 from paddle.incubate.nn.functional import swiglu as fused_swiglu
 
@@ -45,6 +45,7 @@ class MLP(nn.Layer):
         self.act_type = config.get("hidden_act", "silu")
         self.act_fn = ACT2FN[self.act_type]
         self.fuse_up_gate = fuse_up_gate
+        self.gate_up_proj_name = gate_up_proj_name
 
         if self.fuse_up_gate:
             setattr(
@@ -59,7 +60,6 @@ class MLP(nn.Layer):
                     tp_plan="colwise",
                 ),
             )
-            self.up_gate_proj = getattr(self, gate_up_proj_name)
         else:
             # set attr for gate_proj
             setattr(
@@ -108,14 +108,19 @@ class MLP(nn.Layer):
 
     def forward(self, x):
         if self.fuse_up_gate:
+            proj_layer = getattr(self, self.gate_up_proj_name)
             if self.fuse_swiglu:
-                x = self.up_gate_proj(x)
+                x = proj_layer(x)
                 x = fused_swiglu(x)
             else:
-                gate, x = self.up_gate_proj(x).chunk(2, axis=-1)
+                gate, x = proj_layer(x).chunk(2, axis=-1)
                 x = self.act_fn(gate) * x
         else:
             gate = self.gate_proj(x)
             up = self.up_proj(x)
-            x = self.act_fn(gate) * up
+            if self.fuse_swiglu:
+                x = paddle.concat([gate, up], axis=-1)
+                x = fused_swiglu(x)
+            else:
+                x = self.act_fn(gate) * up
         return self.down_proj(x)

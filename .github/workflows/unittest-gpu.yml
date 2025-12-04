@@ -2,7 +2,6 @@ name: Unittest GPU CI
 
 on:
   pull_request:
-  push:
   schedule:
     - cron: "0 18 * * *"
   workflow_call:
@@ -19,14 +18,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PR_ID: ${{ github.event.pull_request.number }}
-  COMMIT_ID: ${{ github.event.pull_request.head.sha }}
+  PR_ID: ${{ github.event.pull_request.number || '0' }}
+  COMMIT_ID: ${{ github.event.pull_request.head.sha || github.sha }}
   TASK: PaddleFormers-CI-${{ github.event.pull_request.number }}-unittest-gpu
   ci_scripts: /workspace/PaddleFormers/scripts/unit_test
-  BRANCH: ${{ github.event.pull_request.base.ref }}
+  BRANCH: ${{ github.event.pull_request.base.ref || github.ref_name }}
   AGILE_COMPILE_BRANCH: ${{ github.event.pull_request.base.ref }}
   CI_name: unittest-gpu-ci
   no_proxy: "localhost,bj.bcebos.com,su.bcebos.com,bcebos.com,apiin.im.baidu.com,gitee.com,aliyun.com,.baidu.com,.tuna.tsinghua.edu.cn"
+  PYTEST_EXECUTE_FLAG_FILE: ${{ github.workspace }}/../../../PYTEST_EXECUTE_FLAG_FILE/${{ github.event.pull_request.number || '0' }}/${{ github.event.pull_request.head.sha || github.sha }}/pytest_execute.flag
+  PYTEST_EXECUTE_FLAG: false
 
 defaults:
   run:
@@ -35,7 +36,9 @@ defaults:
 jobs:
   unittest-gpu-ci:
     name: unittest-gpu-ci
-    runs-on: ${{ inputs.runner || 'ernie-8gpu' }}
+    runs-on: ${{ inputs.runner || 'ernie-8gpu' || 'distrbute' }}
+    outputs:  
+      pytest_execute_flag: ${{ steps.set_pytest_flag.outputs.pytest_execute_flag }}
     steps:
       - name: Determine Image Name
         env:
@@ -52,29 +55,38 @@ jobs:
           work_dir: ${{ github.workspace }}
           FLAGS_dynamic_static_unified_comm: "True"
           python_version: "3.10"
-          paddle_whl: https://paddle-qa.bj.bcebos.com/paddle-pipeline/Develop-GpuAll-LinuxCentos-Gcc11-Cuda126-Cudnn95-Trt105-Py310-Compile/latest/paddlepaddle_gpu-0.0.0-cp310-cp310-linux_x86_64.whl
+          PIP_CACHE_DIR: /home/.cache/pip
+          paddle_whl: https://paddle-qa.bj.bcebos.com/paddle-pipeline/Develop-TagBuild-Training-Linux-Gpu-Cuda12.6-Cudnn9.5-Trt10.5-Mkl-Avx-Gcc11-SelfBuiltPypiUse/latest/paddlepaddle_gpu-0.0.0-cp310-cp310-linux_x86_64.whl
         run: |
           container_name=${TASK}-$(date +%Y%m%d-%H%M%S)
           echo "container_name=${container_name}" >> "$GITHUB_ENV"
-          docker run -d -t --name ${container_name} --net=host -v /dev/shm:/dev/shm --shm-size=32G \
+          echo "Workspace path: ${{ github.workspace }}"
+          DOCKER_VER=$(docker version --format '{{.Server.Version}}' | cut -d. -f1,2)
+          docker run -d -t --gpus all --runtime=nvidia --name ${container_name} --net=host -v /dev/shm:/dev/shm --shm-size=32G \
             -v $work_dir/../../..:$work_dir/../../.. \
-            -v $work_dir:/workspace \
+            -v $work_dir:/github/workspace \
             -v /home/.cache/pip:/home/.cache/pip \
-            -e BRANCH \
-            -e AGILE_COMPILE_BRANCH \
-            -e PR_ID \
-            -e COMMIT_ID \
-            -e work_dir \
-            -e ci_scripts \
-            -e no_proxy \
-            -e CI_name \
-            -e paddle_whl \
-            -e FLAGS_dynamic_static_unified_comm \
-            -e python_version \
-            -e HF_PROXY_PATH=$work_dir/../../../proxy_huggingface \
-            -e AISTUDIO_PROXY_PATH=$work_dir/../../../proxy_aistudio \
-            -w /workspace --runtime=nvidia --privileged $IMAGE_NAME
-            
+            -v /home/paddle-1/models/:/home/models/ \
+            -e PF_HOME=/home/models/ \
+            -e "BRANCH=$BRANCH" \
+            -e "AGILE_COMPILE_BRANCH=$AGILE_COMPILE_BRANCH" \
+            -e "PR_ID=$PR_ID" \
+            -e "COMMIT_ID=$COMMIT_ID" \
+            -e "work_dir=$work_dir" \
+            -e "ci_scripts=$ci_scripts" \
+            -e "PYTEST_EXECUTE_FLAG_FILE=$PYTEST_EXECUTE_FLAG_FILE" \
+            -e "no_proxy=$no_proxy" \
+            -e "CI_JOB_NAME=$CI_JOB_NAME" \
+            -e "paddle_whl=$paddle_whl" \
+            -e "FLAGS_dynamic_static_unified_comm=$FLAGS_dynamic_static_unified_comm" \
+            -e "python_version=$python_version" \
+            -e "HF_PROXY_PATH=$work_dir/../../../proxy_huggingface" \
+            -e "AISTUDIO_PROXY_PATH=$work_dir/../../../proxy_aistudio" \
+            -e "HF_DATASETS_CACHE=$work_dir/../../../paddlenlp/huggingface/datasets" \
+            -e "TRANSFORMERS_CACHE=$work_dir/../../../paddlenlp/huggingface" \
+            -e PIP_CACHE_DIR \
+            -w /github/workspace --privileged $IMAGE_NAME
+
       - name: Download Code
         run: |
           docker exec -t $container_name /bin/bash -c '
@@ -82,6 +94,7 @@ jobs:
             echo "Downloading PaddleFormers.tar"
             wget -q --no-proxy  https://paddle-qa.bj.bcebos.com/CodeSync/develop/PaddleFormers.tar --no-check-certificate
             echo "Extracting PaddleFormers.tar"
+            rm -rf PaddleFormers
             tar xf PaddleFormers.tar && rm -rf PaddleFormers.tar
             source $work_dir/../../../proxy
             cd PaddleFormers
@@ -89,7 +102,7 @@ jobs:
             git config --global user.email "paddle_ci@example.com"
             git pull
             git submodule update --init --recursive --force
-            if [ -n "${PR_ID}" ]; then
+            if [ -n "$PR_ID" ] && [ "$PR_ID" != "0" ]; then
               git fetch origin pull/${PR_ID}/head
               git checkout -b PR_${PR_ID} FETCH_HEAD
               git remote add upstream https://github.com/PaddlePaddle/PaddleFormers.git
@@ -106,139 +119,53 @@ jobs:
         run: |
           docker exec -t $container_name /bin/bash -c '
           ldconfig
-          pip config set global.cache-dir "/home/.cache/pip"
+          mkdir -p /home/.cache/pip
+          pip cache dir
           set -e
           rm -rf /root/.cache/aistudio/
-          cd /workspace/PaddleFormers && git config --global --add safe.directory $PWD
+          cd /github/workspace/PaddleFormers && git config --global --add safe.directory $PWD
           source $work_dir/../../../proxy
           source $work_dir/../../../AISTUDIO_ACCESS_TOKEN
-          timeout 100m bash scripts/unit_test/ci_unit.sh ${paddle_whl}
+          echo "work_dir = ${work_dir}"
+          cp -r ${work_dir}/../../../models ./models
+          echo "Check whether the local model file exists:"
+          ls -l ./models
+          timeout 120m bash -x scripts/unit_test/ci_unittest.sh ${paddle_whl} false ${PYTEST_EXECUTE_FLAG_FILE} ${AGILE_COMPILE_BRANCH}
           '
-          
-      - name: Upload Products
-        if: always()
-        env:
-          home_path: ${{ github.workspace }}/../../..
-          bos_file: ${{ github.workspace }}/../../../bos/BosClient.py
-          allure_file: ${{ github.workspace }}/../../../allure-2.19.0/bin/allure
+      - name: Copy coverage.xml out of container
         run: |
-          docker exec -t $container_name /bin/bash -c '
-          if [ ! -f "${{ env.bos_file }}" ]; then
-            wget -q --no-proxy -O ${{ env.home_path }}/bos_new.tar.gz https://xly-devops.bj.bcebos.com/home/bos_new.tar.gz --no-check-certificate
-            mkdir ${{ env.home_path }}/bos
-            tar xf ${{ env.home_path }}/bos_new.tar.gz -C ${{ env.home_path }}/bos
-          fi
-          if [ ! -f "${{ env.allure_file }}" ]; then
-            wget -q --no-proxy -O ${{ env.home_path }}/allure-2.19.0.zip https://xly-devops.bj.bcebos.com/tools/allure-2.19.0.zip --no-check-certificate
-            unzip -q ${{ env.home_path }}/allure-2.19.0.zip
-          fi
-          if [ -n "${PR_ID}" ]; then
-            bos_prefix="${PR_ID}/${COMMIT_ID}"
-          else
-            bos_prefix="schedule/$(date +%Y%m%d)"
-          fi
-          # coverage.xml
-          cd /workspace/PaddleFormers
-          python ${{ env.bos_file }} coverage.xml paddle-github-action/PR/PaddleFormers/unittest-gpu/${bos_prefix}/logs
-          echo "cov-report: https://paddle-github-action.bj.bcebos.com/PR/PaddleFormers/unittest-gpu/${bos_prefix}/logs/coverage.xml"
-          # logs
-          cd /workspace/PaddleFormers/unittest_logs
-          for FILE in /workspace/PaddleFormers/unittest_logs/*; do
-            file=$(basename "$FILE")
-            python ${{ env.bos_file }} $file paddle-github-action/PR/PaddleFormers/unittest-gpu/${bos_prefix}/logs
-            echo "$file: https://paddle-github-action.bj.bcebos.com/PR/PaddleFormers/unittest-gpu/${bos_prefix}/logs/$file"
-          done
-          # allure
-          # cd /workspace/PaddleFormers/
-          # ${{ env.allure_file }} generate result -o report
-          # tar -czf report.tar.gz report
-          # python ${{ env.bos_file }} report.tar.gz paddle-github-action/PR/PaddleFormers/unittest-gpu/${bos_prefix}/logs
-          # echo "report: https://paddle-github-action.bj.bcebos.com/PR/PaddleFormers/unittest-gpu/${bos_prefix}/logs/report.tar.gz"
-          '
+          docker cp $container_name:/github/workspace/PaddleFormers/coverage.xml coverage.xml
+        continue-on-error: true
 
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          
       - name: Terminate And Delete the Container
         if: always()
         run: |
           docker rm -f $container_name 2>/dev/null || true
-          
+
   upload-coverage:
-    name: upload-coverage
-    needs: [unittest-gpu-ci]
-    if: always()
+    needs: unittest-gpu-ci
+    if: ${{ needs.unittest-gpu-ci.outputs.pytest_execute_flag == 'true' }}
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
-
-      - name: Download coverage.xml
-        run: |
-          if [ -n "${PR_ID}" ]; then
-            bos_prefix="${PR_ID}/${COMMIT_ID}"
-          else
-            bos_prefix="schedule/$(date +%Y%m%d)"
-          fi
-          wget -q --no-proxy \
-            https://paddle-github-action.bj.bcebos.com/PR/PaddleFormers/unittest-gpu/${bos_prefix}/logs/coverage.xml \
-            --no-check-certificate -O coverage.xml
-
-      - name: Fix coverage.xml paths
-        run: |
-          echo "Before fix:"
-          head -n 10 coverage.xml || true
-
-          old_source=$(grep -oPm1 '(?<=<source>).*?(?=</source>)' coverage.xml || true)
-          if [ -n "$old_source" ]; then
-            echo "Replacing source '$old_source' with 'paddleformers'"
-            sed -i "s|<source>$old_source</source>|<source>paddleformers</source>|g" coverage.xml
-          else
-            echo "No <source> found, injecting <source>paddleformers</source>"
-            sed -i 's|<sources>|<sources>\n        <source>paddleformers</source>|' coverage.xml
-          fi
-
-          echo "After fix:"
-          head -n 10 coverage.xml || true
+          name: coverage
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
           files: coverage.xml
+          commit: ${{ github.event.pull_request.head.sha }}
+          commit_parent: ${{ github.event.pull_request.base.sha }}
+          fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-  # upload-allure:
-  #   name: upload-allure
-  #   needs: [unittest-gpu-ci]
-  #   if: success() || failure()
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Checkout Code
-  #       uses: actions/checkout@v4
-  #       with:
-  #         fetch-depth: 0
-
-  #     - name: Download report.tar.gz
-  #       run: |
-  #         if [ -n "${PR_ID}" ]; then
-  #           bos_prefix="${PR_ID}/${COMMIT_ID}"
-  #         else
-  #           bos_prefix="schedule/$(date +%Y%m%d)"
-  #         fi
-  #         wget -q --no-proxy \
-  #           https://paddle-github-action.bj.bcebos.com/PR/PaddleFormers/unittest-gpu/${bos_prefix}/logs/report.tar.gz \
-  #           --no-check-certificate -O report.tar.gz
-  #         tar -xzf report.tar.gz
-
-  #     - name: Upload Allure Report
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: allure-report
-  #         path: report
-  #         if-no-files-found: ignore
-
-  #     - name: Deploy allure report to GitHub Pages
-  #       uses: peaceiris/actions-gh-pages@v4
-  #       with:
-  #         github_token: ${{ secrets.GITHUB_TOKEN }}
-  #         publish_dir: ./report

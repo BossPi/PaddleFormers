@@ -19,7 +19,6 @@ from ..utils.lazy_import import _LazyModule
 
 import_structure = {
     "argparser": ["PdArgumentParser", "strtobool"],
-    "auto_training_args": ["AutoTrainingArguments"],
     "plugins.timer": ["_Timer", "RuntimeTimer", "set_timers", "get_timers", "disable_timers", "Timers"],
     "trainer": [
         "TRAINING_ARGS_NAME",
@@ -79,6 +78,7 @@ import_structure = {
         "FP8QuantWeightCallback",
         "MoECorrectionBiasAdjustCallback",
         "MoeExpertsGradScaleCallback",
+        "MoEGateSpGradSyncCallBack",
     ],
     "trainer_utils": [
         "get_last_checkpoint",

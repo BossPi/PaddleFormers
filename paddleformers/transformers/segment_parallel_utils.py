@@ -79,7 +79,7 @@ def _reshard_qkv(x, group, split_axis=2, concat_axis=0):
     comm_tensor_list = paddle.split(x, nranks, axis=split_axis)
     output_list = [paddle.empty_like(comm_tensor_list[0]) for _ in comm_tensor_list]
     dist.alltoall(output_list, comm_tensor_list, group=group)
-    reshard_tensor = paddle.concat(output_list, axis=concat_axis)
+    reshard_tensor = paddle.cat(output_list, axis=concat_axis)
 
     return reshard_tensor
 
@@ -135,3 +135,31 @@ class ReshardLayer(paddle.nn.Layer):
             )
             reshard_tensor.reshape_(shape)
         return reshard_tensor
+
+
+def auto_split_inputs_sequence_dim(inputs):
+    def do_split_sequence_dim(data):
+        if data is None:
+            return None
+
+        data_mesh = data.process_mesh
+        data_placements = data.placements
+        sep_axis = data_mesh.dim_names.index("sep")
+        # shard along sep axis
+        data_placements[sep_axis] = dist.Shard(1)
+        data = dist.reshard(data, data_mesh, data_placements)
+        return data
+
+    if isinstance(inputs, paddle.Tensor):
+        return do_split_sequence_dim(inputs)
+    elif isinstance(inputs, dict):
+        res = {}
+        for k, tensor in inputs.items():
+            res[k] = do_split_sequence_dim(tensor)
+    elif isinstance(inputs, list):
+        res = []
+        for tensor in inputs:
+            res.append(do_split_sequence_dim(tensor))
+    else:
+        raise ValueError(f"the inputs should be a tensor, list or dict, but is type: {type(inputs)}")
+    return res

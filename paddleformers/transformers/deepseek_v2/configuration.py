@@ -14,6 +14,7 @@
 # limitations under the License.
 """ DeepSeekV2 model configuration"""
 from ..configuration_utils import PretrainedConfig
+from ..modeling_rope_utils import rope_config_validation, standardize_rope_params
 
 __all__ = [
     "DeepseekV2Config",
@@ -140,7 +141,7 @@ class DeepseekV2Config(PretrainedConfig):
         moe_intermediate_size=1407,
         num_hidden_layers=30,
         num_nextn_predict_layers=0,
-        num_nextn_predict_lambda=1.0,
+        num_nextn_predict_lambda=0.1,
         num_attention_heads=32,
         num_key_value_heads=32,
         n_shared_experts=None,
@@ -160,7 +161,7 @@ class DeepseekV2Config(PretrainedConfig):
         first_k_dense_replace=0,
         norm_topk_prob=False,
         scoring_func="softmax",
-        aux_loss_alpha=0.001,
+        aux_loss_alpha=0.0001,
         seq_aux=True,
         hidden_act="silu",
         max_position_embeddings=2048,
@@ -177,8 +178,6 @@ class DeepseekV2Config(PretrainedConfig):
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
-        speculate_model_type=False,
-        using_flex_token=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -224,9 +223,10 @@ class DeepseekV2Config(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.speculate_model_type = speculate_model_type
-        self.use_fp8 = False
-        self.using_flex_token = using_flex_token
+
+        self.rope_parameters = rope_scaling
+        standardize_rope_params(self, rope_theta=rope_theta)
+        rope_config_validation(self)
 
         super().__init__(
             pad_token_id=pad_token_id,

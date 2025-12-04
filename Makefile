@@ -19,7 +19,7 @@ format:
 
 .PHONY: lint
 lint:
-	$(eval modified_py_files := $(shell python scripts/get_modified_files.py $(check_dirs)))
+	$(eval modified_py_files := $(shell python scripts/codestyle/get_modified_files.py $(check_dirs)))
 	@if test -n "$(modified_py_files)"; then \
 		echo ${modified_py_files}; \
 		pre-commit run --files ${modified_py_files}; \
@@ -46,9 +46,26 @@ unit-test:
 
 .PHONY: install
 install:
-	pip install --pre paddlepaddle -i https://www.paddlepaddle.org.cn/packages/nightly/cpu/
-	pip install -r requirements-dev.txt
-	pip install -r requirements.txt
+	@echo "Checking CUDA version and selecting pip source..."
+	@if ! command -v nvcc >/dev/null 2>&1; then \
+	    echo "ERROR: nvcc (CUDA) not found. Please install CUDA before proceeding."; \
+	    exit 1; \
+	fi; \
+	cuda_version=$$(nvcc --version | grep release | awk '{print $$5}' | sed 's/,//'); \
+	echo "Detected CUDA version: $$cuda_version"; \
+	if [ "$$cuda_version" = "12.6" ]; then \
+	    PADDLE_SOURCE="https://www.paddlepaddle.org.cn/packages/nightly/cu126/"; \
+	elif [ "$$cuda_version" = "12.9" ]; then \
+	    PADDLE_SOURCE="https://www.paddlepaddle.org.cn/packages/nightly/cu129/"; \
+	elif [ "$$cuda_version" = "13.0" ]; then \
+	    PADDLE_SOURCE="https://www.paddlepaddle.org.cn/packages/nightly/cu130/"; \
+	else \
+	    PADDLE_SOURCE=""; \
+	    echo "Unknown CUDA version."; \
+	fi; \
+	echo "Using pip source: $$PADDLE_SOURCE"; \
+	pip install -r requirements-dev.txt \
+	pip install -r requirements.txt --extra-index-url "$$PADDLE_SOURCE"; \
 	pre-commit install
 
 
@@ -68,11 +85,3 @@ deploy-paddleformers:
 	python3 setup.py sdist bdist_wheel
 	# upload
 	twine upload --skip-existing dist/*
-
-.PHONY: regression-all
-release: 
-	bash ./scripts/regression/run_release.sh 0 0,1 all
-
-.PHONY: regression-key
-key: 
-	bash ./scripts/regression/run_release.sh 0 0,1 p0

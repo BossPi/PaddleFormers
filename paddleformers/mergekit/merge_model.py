@@ -67,6 +67,7 @@ class MergeModel:
 
     def reset_merge_model(self, merge_config=None, merge_param_dict=None):
         self.is_cpu = "cpu" in paddle.device.get_device()
+        self.is_xpu = "xpu" in paddle.device.get_device()
         if not self.is_cpu:
             if dist.get_world_size() > 1 and not paddle.distributed.is_initialized():
                 dist.init_parallel_env()
@@ -184,9 +185,9 @@ class MergeModel:
                     if self.merge_config.base_model_path is not None:
                         merge_tensor += base_tensor
                     if is_bf16:
-                        merge_split.append(merge_tensor.astype("bfloat16").numpy())
+                        merge_split.append(merge_tensor.astype("float32").cpu().numpy().astype(ml_dtypes.bfloat16))
                     else:
-                        merge_split.append(merge_tensor.numpy())
+                        merge_split.append(merge_tensor.cpu().numpy())
                 merge_state_dict[key] = np.concatenate(merge_split, axis=0)
             else:
                 if self.merge_config.tensor_type == "pd":
@@ -198,7 +199,7 @@ class MergeModel:
                         tensor_list = [paddle.Tensor.__call__(tensor, zero_copy=True) for tensor in tensor_list]
                 elif self.merge_config.tensor_type == "np" and is_bf16:
                     tensor_list = [
-                        paddle.Tensor.__call__(tensor, zero_copy=True).astype("float32").numpy()
+                        paddle.Tensor.__call__(tensor, zero_copy=True).astype("float32").cpu().numpy()
                         for tensor in tensor_list
                     ]
 
@@ -211,13 +212,16 @@ class MergeModel:
                     merge_tensor += base_tensor
                 if self.merge_config.tensor_type == "pd":
                     if is_bf16:
-                        merge_state_dict[key] = merge_tensor.astype("bfloat16").numpy()
+                        merge_state_dict[key] = merge_tensor.astype("float32").cpu().numpy().astype(ml_dtypes.bfloat16)
                     else:
-                        merge_state_dict[key] = merge_tensor.numpy()
+                        merge_state_dict[key] = merge_tensor.cpu().numpy()
                 elif self.merge_config.tensor_type == "np" and is_bf16:
-                    # dtype==bfloat16: numpy(float32) -> paddle(float32) -> paddle(bfloat16) -> numpy(uint16)
                     merge_state_dict[key] = (
-                        paddle.Tensor.__call__(merge_tensor, zero_copy=True).astype("bfloat16").numpy()
+                        paddle.Tensor.__call__(merge_tensor, zero_copy=True)
+                        .astype("float32")
+                        .cpu()
+                        .numpy()
+                        .astype(ml_dtypes.bfloat16)
                     )
 
         logger.info("Merge tensors successfully.")
@@ -412,7 +416,7 @@ class MergeModel:
                     dtype = tensor.dtype
                     # dtype==bfloat16: numpy(uint16) -> paddle(bfloat16) -> paddle(float32) -> numpy(float32)
                     if tensor.dtype == np.uint16:
-                        tensor = paddle.Tensor.__call__(tensor, zero_copy=True).astype("float32").numpy()
+                        tensor = paddle.Tensor.__call__(tensor, zero_copy=True).astype("float32").cpu().numpy()
                     tensor_list.append(tensor)
             if self.merge_config.base_model_path is not None:
                 with fast_safe_open(
@@ -421,15 +425,20 @@ class MergeModel:
                 ) as w:
                     base_tensor = w.get_tensor(k)
                     if base_tensor.dtype == np.uint16:
-                        base_tensor = paddle.Tensor.__call__(base_tensor, zero_copy=True).astype("float32").numpy()
+                        base_tensor = (
+                            paddle.Tensor.__call__(base_tensor, zero_copy=True).astype("float32").cpu().numpy()
+                        )
                 tensor_list = [tensor - base_tensor for tensor in tensor_list]
             merge_state_dict[k] = self.merge_method.merge(tensor_list)
             if self.merge_config.base_model_path is not None:
                 merge_state_dict[k] += base_tensor
-            # dtype==bfloat16: numpy(float32) -> paddle(float32) -> paddle(bfloat16) -> numpy(uint16)
             if dtype == np.uint16:
                 merge_state_dict[k] = (
-                    paddle.Tensor.__call__(merge_state_dict[k], zero_copy=True).astype("bfloat16").numpy()
+                    paddle.Tensor.__call__(merge_state_dict[k], zero_copy=True)
+                    .astype("float32")
+                    .cpu()
+                    .numpy()
+                    .astype(ml_dtypes.bfloat16)
                 )
         save_file(
             merge_state_dict,
@@ -479,9 +488,9 @@ class MergeModel:
                     if self.merge_config.base_model_path is not None:
                         merge_tensor += base_tensor
                     if is_bf16:
-                        merge_split.append(merge_tensor.astype("bfloat16").numpy())
+                        merge_split.append(merge_tensor.astype("float32").cpu().numpy().astype(ml_dtypes.bfloat16))
                     else:
-                        merge_split.append(merge_tensor.numpy())
+                        merge_split.append(merge_tensor.cpu().numpy())
                 merge_state_dict[k] = np.concatenate(merge_split, axis=0)
             else:
                 if is_bf16:
@@ -497,9 +506,9 @@ class MergeModel:
                 if self.merge_config.base_model_path is not None:
                     merge_tensor += base_tensor
                 if is_bf16:
-                    merge_state_dict[k] = merge_tensor.astype("bfloat16").numpy()
+                    merge_state_dict[k] = merge_tensor.astype("float32").cpu().numpy().astype(ml_dtypes.bfloat16)
                 else:
-                    merge_state_dict[k] = merge_tensor.numpy()
+                    merge_state_dict[k] = merge_tensor.cpu().numpy()
         logger.info("Merge tensors successfully.")
         save_file_name = os.path.join(self.merge_config.output_path, shard_file)
         save_file(
@@ -562,6 +571,48 @@ class MergeModel:
         else:
             self.merge_pdparams_lora_model(file_type_list)
 
+    def get_split_qkv_hidden_size(self, base_state_dict):
+        q_size, k_size, v_size = None, None, None
+        for key in base_state_dict.keys():
+            if key.endswith(".q_proj.weight"):
+                q_size = base_state_dict[key].shape[1]
+            elif key.endswith(".k_proj.weight"):
+                k_size = base_state_dict[key].shape[1]
+            elif key.endswith(".v_proj.weight"):
+                v_size = base_state_dict[key].shape[1]
+            if not (q_size is None or k_size is None or v_size is None):
+                break
+        return q_size, k_size, v_size
+
+    def split_fuse_lora_state_dict(self, base_state_dict, lora_state_dict):
+        # split fuse qkv/ffn
+        q_size, k_size, v_size = self.get_split_qkv_hidden_size(base_state_dict)
+        if not (q_size is None or k_size is None or v_size is None):
+            lora_state_dict_keys = list(lora_state_dict.keys())
+            for lora_key in lora_state_dict_keys:
+                if lora_key.endswith(".qkv_proj.lora_B"):
+                    lora_B_q, lora_B_k, lora_B_v = np.split(
+                        lora_state_dict.pop(lora_key), [q_size, q_size + k_size], axis=1
+                    )
+                    lora_state_dict[lora_key.replace(".qkv_proj.", ".q_proj.")] = lora_B_q
+                    lora_state_dict[lora_key.replace(".qkv_proj.", ".k_proj.")] = lora_B_k
+                    lora_state_dict[lora_key.replace(".qkv_proj.", ".v_proj.")] = lora_B_v
+                    lora_A_qkv_key = lora_key.replace(".lora_B", ".lora_A")
+                    lora_A_qkv_tensor = lora_state_dict.pop(lora_A_qkv_key)
+                    for qkv_key in ["q_proj", "k_proj", "v_proj"]:
+                        lora_state_dict[lora_A_qkv_key.replace(".qkv_proj.", f".{qkv_key}.")] = lora_A_qkv_tensor
+
+                elif lora_key.endswith(".up_gate_proj.lora_B") or lora_key.endswith(".gate_up_proj.lora_B"):
+                    fuse_ffn_flag = ".up_gate_proj." if lora_key.endswith(".up_gate_proj.lora_B") else ".gate_up_proj."
+                    lora_B_gate, lora_B_up = np.split(lora_state_dict.pop(lora_key), 2, axis=1)
+                    lora_state_dict[lora_key.replace(fuse_ffn_flag, ".gate_proj.")] = lora_B_gate
+                    lora_state_dict[lora_key.replace(fuse_ffn_flag, ".up_proj.")] = lora_B_up
+                    lora_A_ffn_key = lora_key.replace(".lora_B", ".lora_A")
+                    lora_A_ffn_tensor = lora_state_dict.pop(lora_A_ffn_key)
+                    for ffn_key in ["gate_proj", "up_proj"]:
+                        lora_state_dict[lora_A_ffn_key.replace(fuse_ffn_flag, f".{ffn_key}.")] = lora_A_ffn_tensor
+        return lora_state_dict
+
     def shard_lora_merge(self, base_index, shard_file, lora_config, file_type_list, key_list=None, file=None):
         merge_state_dict = {}
         lora_state_dict = self.get_model_state_dict(self.merge_config.lora_model_path, file_type_list[0])
@@ -570,6 +621,7 @@ class MergeModel:
             self.merge_config.base_model_path, file_type_list[1], key_list=key_list, file=file
         )
         logger.info("Load model weight successfully.")
+        lora_state_dict = self.split_fuse_lora_state_dict(base_state_dict, lora_state_dict)
         if not lora_config.rslora:
             scaling = lora_config.lora_alpha / lora_config.r
         else:
@@ -587,18 +639,26 @@ class MergeModel:
                 if lora_state_dict is not None and lora_A_key in lora_state_dict.keys():
                     lora_A_tensor, lora_B_tensor = lora_state_dict.pop(lora_A_key), lora_state_dict.pop(lora_B_key)
                     is_bf16 = str(tensor.dtype) in ["uint16", "bfloat16"]
+                    if self.is_xpu:
+                        if str(tensor.dtype) == "bfloat16":
+                            tensor = tensor.view("uint16")
+                        if str(lora_A_tensor.dtype) == "bfloat16":
+                            lora_A_tensor = lora_A_tensor.view("uint16")
+                        if str(lora_B_tensor.dtype) == "bfloat16":
+                            lora_B_tensor = lora_B_tensor.view("uint16")
+
                     tensor = paddle.Tensor.__call__(tensor, zero_copy=True)
                     lora_A_tensor = paddle.Tensor.__call__(lora_A_tensor, zero_copy=True)
                     lora_B_tensor = paddle.Tensor.__call__(lora_B_tensor, zero_copy=True)
-                    if self.is_cpu and is_bf16 or self.merge_config.save_to_hf:
+                    if is_bf16:
                         tensor = tensor.astype("float32")
                         lora_A_tensor = lora_A_tensor.astype("float32")
                         lora_B_tensor = lora_B_tensor.astype("float32")
                         tensor += lora_A_tensor @ lora_B_tensor * scaling
-                        tensor = tensor.numpy().astype(ml_dtypes.bfloat16)
+                        tensor = tensor.cpu().numpy().astype(ml_dtypes.bfloat16)
                     else:
                         tensor += lora_A_tensor @ lora_B_tensor * scaling
-                        tensor = tensor.numpy()
+                        tensor = tensor.cpu().numpy()
             merge_state_dict[k] = tensor
         if self.merge_config.save_to_hf and self.transpose_weight_keys is not None:
             merge_state_dict = ConversionMixin.convert_transpose_selected_weights(
@@ -702,6 +762,7 @@ class MergeModel:
         logger.info("Load LoRA weight successfully.")
         base_state_dict = self.get_model_state_dict(self.merge_config.base_model_path, file_type_list[1])
         logger.info("Load model weight successfully.")
+        lora_state_dict = self.split_fuse_lora_state_dict(base_state_dict, lora_state_dict)
         for key in lora_state_dict.keys():
             if "lora_A" in key:
                 if key.replace("lora_A", "lora_B") not in lora_state_dict.keys():
@@ -743,19 +804,26 @@ class MergeModel:
                     lora_A_tensor = lora_state_dict[lora_A_key]
                     lora_B_tensor = lora_state_dict[lora_B_key]
                     is_bf16 = str(tensor.dtype) in ["uint16", "bfloat16"]
+                    if self.is_xpu:
+                        if str(tensor.dtype) == "bfloat16":
+                            tensor = tensor.view("uint16")
+                        if str(lora_A_tensor.dtype) == "bfloat16":
+                            lora_A_tensor = lora_A_tensor.view("uint16")
+                        if str(lora_B_tensor.dtype) == "bfloat16":
+                            lora_B_tensor = lora_B_tensor.view("uint16")
 
                     tensor = paddle.Tensor.__call__(tensor, zero_copy=True)
                     lora_A_tensor = paddle.Tensor.__call__(lora_A_tensor, zero_copy=True)
                     lora_B_tensor = paddle.Tensor.__call__(lora_B_tensor, zero_copy=True)
-                    if self.is_cpu and is_bf16:
+                    if is_bf16:
                         tensor = tensor.astype("float32")
                         lora_A_tensor = lora_A_tensor.astype("float32")
                         lora_B_tensor = lora_B_tensor.astype("float32")
                         tensor += lora_A_tensor @ lora_B_tensor * scaling
-                        tensor = tensor.astype("bfloat16")
+                        tensor = tensor.cpu().numpy().astype(ml_dtypes.bfloat16)
                     else:
                         tensor += lora_A_tensor @ lora_B_tensor * scaling
-                    tensor = tensor.numpy()
+                        tensor = tensor.cpu().numpy()
             merge_state_dict[k] = tensor
 
         # Save safetensor file

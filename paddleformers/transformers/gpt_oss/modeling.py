@@ -13,13 +13,12 @@
 # limitations under the License.
 
 import math
-from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import paddle
 from paddle import Tensor, nn
 from paddle.distributed.fleet.recompute.recompute import recompute
-from paddle.distributed.fleet.utils.sequence_parallel_utils import ScatterOp
+from paddle.distributed.fleet.utils.sequence_parallel_utils import GatherOp, ScatterOp
 from paddle.nn import functional as F
 
 from ...nn.attention.interface import ALL_ATTENTION_FUNCTIONS
@@ -30,8 +29,14 @@ from ...nn.lm_head import LMHead as GeneralLMHead
 from ...nn.norm import Norm as GeneralNorm
 from ...nn.pp_model import GeneralModelForCausalLMPipe
 from ...utils.log import logger
+from ..cache_utils import Cache, DynamicCache
+from ..masking_utils import (
+    create_causal_mask_and_row_indices,
+    create_sliding_window_causal_mask_and_row_indices,
+)
 from ..model_outputs import MoECausalLMOutputWithPast, MoEModelOutputWithPast
 from ..model_utils import PretrainedModel, register_base_model
+from ..modeling_rope_utils import dynamic_rope_update
 from .configuration import GptOssConfig
 
 
@@ -52,7 +57,7 @@ def _make_causal_mask(input_ids_shape, past_key_values_length):
 
     if past_key_values_length > 0:
         # [tgt_len, tgt_len + past_len]
-        mask = paddle.concat([paddle.ones([target_length, past_key_values_length], dtype="bool"), mask], axis=-1)
+        mask = paddle.cat([paddle.ones([target_length, past_key_values_length], dtype="bool"), mask], axis=-1)
 
     # [bs, 1, tgt_len, tgt_len + past_len]
     return mask[None, None, :, :].expand([batch_size, 1, target_length, target_length + past_key_values_length])
@@ -76,9 +81,11 @@ class GptOssExperts(nn.Layer):
     def __init__(self, config):
         super().__init__()
         self.intermediate_size = config.intermediate_size
+        self.sequence_parallel = config.sequence_parallel
         self.num_experts = config.num_experts
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
+
         self.gate_up_proj = paddle.create_parameter(
             shape=[self.num_experts, self.hidden_size, 2 * self.expert_dim],
             dtype=paddle.get_default_dtype(),
@@ -145,7 +152,11 @@ class GptOssExperts(nn.Layer):
                     0,
                     weighted_output.astype(hidden_states.dtype),
                 )
-            next_states = next_states.reshape([batch_size, -1, self.hidden_size])
+            if self.sequence_parallel:
+                next_states = next_states.reshape([-1, self.hidden_size])
+            else:
+                next_states = next_states.reshape([batch_size, -1, self.hidden_size])
+
         else:
             hidden_states = paddle.tile(hidden_states, repeat_times=[num_experts, 1])
             hidden_states = hidden_states.reshape((num_experts, -1, self.hidden_size))
@@ -156,11 +167,16 @@ class GptOssExperts(nn.Layer):
             glu = gate * F.sigmoid(gate * self.alpha)
             next_states = paddle.bmm(((up + 1) * glu), self.down_proj)
             next_states = next_states + self.down_proj_bias[..., None, :]
-            next_states = next_states.reshape((num_experts, batch_size, -1, self.hidden_size))
-            next_states = (
-                next_states * routing_weights.transpose([0, 1]).reshape((num_experts, batch_size, -1))[..., None]
-            )
+            if self.sequence_parallel:
+                next_states = next_states.reshape((num_experts, -1, self.hidden_size))
+                next_states = next_states * routing_weights.transpose([0, 1]).reshape((num_experts, -1))[..., None]
+            else:
+                next_states = next_states.reshape((num_experts, batch_size, -1, self.hidden_size))
+                next_states = (
+                    next_states * routing_weights.transpose([0, 1]).reshape((num_experts, batch_size, -1))[..., None]
+                )
             next_states = next_states.sum(axis=0)
+
         return next_states
 
 
@@ -196,10 +212,15 @@ class GptOssMLP(nn.Layer):
         super().__init__()
         self.router = GptOssTopKRouter(config)
         self.experts = GptOssExperts(config)
+        self.sequence_parallel = config.sequence_parallel
 
     def forward(self, hidden_states):
+        if self.sequence_parallel:
+            hidden_states = GatherOp.apply(hidden_states)
         router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
         routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+        if self.sequence_parallel:
+            routed_out = ScatterOp.apply(routed_out)
         return routed_out, router_scores
 
 
@@ -220,14 +241,14 @@ def _compute_yarn_parameters(config, device: paddle.device, seq_len: Optional[in
     partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     dim = int(head_dim * partial_rotary_factor)
-    factor = config.rope_scaling["factor"]
-    attention_factor = config.rope_scaling.get("attention_factor")
-    mscale = config.rope_scaling.get("mscale")
-    mscale_all_dim = config.rope_scaling.get("mscale_all_dim")
+    factor = config.rope_parameters["factor"]
+    attention_factor = config.rope_parameters.get("attention_factor")
+    mscale = config.rope_parameters.get("mscale")
+    mscale_all_dim = config.rope_parameters.get("mscale_all_dim")
 
     # Handling the situation of embedding the original maximum position
-    if "original_max_position_embeddings" in config.rope_scaling:
-        original_max_position_embeddings = config.rope_scaling["original_max_position_embeddings"]
+    if "original_max_position_embeddings" in config.rope_parameters:
+        original_max_position_embeddings = config.rope_parameters["original_max_position_embeddings"]
         factor = config.max_position_embeddings / original_max_position_embeddings
     else:
         original_max_position_embeddings = config.max_position_embeddings
@@ -245,8 +266,8 @@ def _compute_yarn_parameters(config, device: paddle.device, seq_len: Optional[in
             attention_factor = get_mscale(factor)
 
     # Optional configuration parameters
-    beta_fast = config.rope_scaling.get("beta_fast") or 32
-    beta_slow = config.rope_scaling.get("beta_slow") or 1
+    beta_fast = config.rope_parameters.get("beta_fast") or 32
+    beta_slow = config.rope_parameters.get("beta_slow") or 1
 
     # Auxiliary function for calculating inverse frequency
     def find_correction_dim(num_rotations, dim, base, max_position_embeddings):
@@ -277,7 +298,7 @@ def _compute_yarn_parameters(config, device: paddle.device, seq_len: Optional[in
     inv_freq_extrapolation = 1.0 / pos_freqs
     inv_freq_interpolation = 1.0 / (factor * pos_freqs)
 
-    truncate = config.rope_scaling.get("truncate", True)
+    truncate = config.rope_parameters.get("truncate", True)
     low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings, truncate)
 
     # Obtain n-dimensional rotation scaling correction for extrapolation
@@ -293,8 +314,8 @@ class GptOssRotaryEmbedding(nn.Layer):
     def __init__(self, config: GptOssConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        if hasattr(config, "rope_parameters") and isinstance(config.rope_parameters, dict):
+            self.rope_type = config.rope_parameters.get("rope_type", config.rope_parameters.get("type"))
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -314,6 +335,7 @@ class GptOssRotaryEmbedding(nn.Layer):
         self.original_inv_freq = self.inv_freq
 
     @paddle.no_grad()
+    @dynamic_rope_update
     def forward(self, x, position_ids):
         inv_freq_expanded = (
             self.inv_freq.unsqueeze(0)
@@ -337,10 +359,10 @@ def _apply_rotary_emb(
     cos: paddle.Tensor,
     sin: paddle.Tensor,
 ) -> paddle.Tensor:
-    first_half, second_half = paddle.chunk(x.transpose([0, 2, 1, 3]), 2, axis=-1)
+    first_half, second_half = paddle.chunk(x, 2, axis=-1)
     first_ = first_half * cos - second_half * sin
     second_ = second_half * cos + first_half * sin
-    return paddle.concat((first_, second_), axis=-1).transpose([0, 2, 1, 3])
+    return paddle.cat((first_, second_), axis=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -379,7 +401,6 @@ class GptOssAttention(nn.Layer):
         self.attention_bias = config.attention_bias
 
         self.sequence_parallel = config.sequence_parallel
-        self.fuse_attention_qkv = config.fuse_attention_qkv
 
         self.scaling = self.head_dim**-0.5
 
@@ -436,7 +457,7 @@ class GptOssAttention(nn.Layer):
     def forward(
         self,
         hidden_states,
-        past_key_value: Optional[Tuple[paddle.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         attention_mask: Optional[paddle.Tensor] = None,
         attn_mask_startend_row_indices: Optional[paddle.Tensor] = None,
         position_ids: Optional[Tuple[paddle.Tensor]] = None,
@@ -449,7 +470,7 @@ class GptOssAttention(nn.Layer):
 
         Args:
             hidden_states (paddle.Tensor): Input tensor [bsz, seq_len, hidden_size]
-            past_key_value (Optional[Tuple[paddle.Tensor, paddle.Tensor]]): Cached key/value states
+            past_key_values (Optional[Cache]): Cached key/value states
             attention_mask (Optional[paddle.Tensor]): Attention mask tensor
             attn_mask_startend_row_indices (Optional[paddle.Tensor]): Variable length attention indices
             position_ids (Optional[paddle.Tensor]): Position indices for RoPE
@@ -467,22 +488,26 @@ class GptOssAttention(nn.Layer):
         value_states = self.v_proj(hidden_states)
 
         if self.sequence_parallel:
-            target_query_shape = [batch_size, -1, self.num_heads, self.head_dim]
-            target_key_value_shape = [batch_size, -1, self.num_key_value_heads, self.head_dim]
+            if batch_size is None:
+                batch_size = (
+                    hidden_states.shape[0] * self.config.tensor_parallel_degree // self.config.max_sequence_length
+                )
+            q_len = self.config.max_sequence_length
+            target_query_shape = [batch_size, q_len, self.num_heads, self.head_dim]
+            target_key_value_shape = [batch_size, q_len, self.num_key_value_heads, self.head_dim]
         else:
             target_query_shape = [0, 0, self.num_heads, self.head_dim]
             target_key_value_shape = [0, 0, self.num_key_value_heads, self.head_dim]
-        query_states = query_states.reshape(target_query_shape)
-        key_states = key_states.reshape(target_key_value_shape)
-        value_states = value_states.reshape(target_key_value_shape)
+        # b l h d -> b h l d
+        query_states = query_states.reshape(target_query_shape).transpose(1, 2)
+        key_states = key_states.reshape(target_key_value_shape).transpose(1, 2)
+        value_states = value_states.reshape(target_key_value_shape).transpose(1, 2)
 
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        if past_key_value is not None:
-            key_states = paddle.concat([past_key_value[0], key_states], axis=1)
-            value_states = paddle.concat([past_key_value[1], value_states], axis=1)
-        past_key_value = (key_states, value_states) if use_cache else None
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -505,7 +530,7 @@ class GptOssAttention(nn.Layer):
 
         if not output_attentions:
             attn_weights = None
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 
 class GptOssDecoderLayer(nn.Layer):
@@ -521,6 +546,7 @@ class GptOssDecoderLayer(nn.Layer):
             hidden_size=config.hidden_size,
             has_bias=config.use_bias,
             norm_eps=self.config.rms_norm_eps,
+            input_is_parallel=config.sequence_parallel,
         )
         self.post_attention_layernorm = GeneralNorm.create(
             config=config,
@@ -528,6 +554,7 @@ class GptOssDecoderLayer(nn.Layer):
             hidden_size=config.hidden_size,
             has_bias=config.use_bias,
             norm_eps=self.config.rms_norm_eps,
+            input_is_parallel=config.sequence_parallel,
         )
 
         if config.sequence_parallel:
@@ -543,7 +570,7 @@ class GptOssDecoderLayer(nn.Layer):
         attention_mask: Optional[paddle.Tensor] = None,
         output_attentions: Optional[bool] = False,
         output_router_logits: Optional[bool] = False,
-        past_key_value: Optional[Tuple[paddle.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[paddle.Tensor, paddle.Tensor]] = None,
         attn_mask_startend_row_indices: Optional[paddle.Tensor] = None,
@@ -560,16 +587,16 @@ class GptOssDecoderLayer(nn.Layer):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            past_key_value (`Tuple(paddle.Tensor)`, *optional*): cached past key and value projection states
+            past_key_values (`Cache`, *optional*): cached past key and value object
         """
         # [bs * seq_len, embed_dim] -> [seq_len * bs / n, embed_dim] (sequence_parallel)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             attention_mask=attention_mask,
             attn_mask_startend_row_indices=attn_mask_startend_row_indices,
             position_ids=position_ids,
@@ -591,8 +618,6 @@ class GptOssDecoderLayer(nn.Layer):
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
-        if use_cache:
-            outputs += (present_key_value,)
         if output_router_logits:
             outputs += (router_logits,)
         if type(outputs) is tuple and len(outputs) == 1:
@@ -609,67 +634,142 @@ class GptOssPreTrainedModel(PretrainedModel):
     transpose_weight_keys = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     @classmethod
-    def _get_tensor_parallel_mappings(cls, config: GptOssConfig, is_split=True):
-        from ..conversion_utils import split_or_merge_func
+    def _gen_aoa_config(cls, config: GptOssConfig):
+        model_prefix = "" if cls == cls.base_model_class else "model."
+        aoa_config = {
+            "aoa_statements": [
+                f"_ -> {model_prefix}rotary_emb.inv_freq",
+                f"_ -> {model_prefix}rotary_emb.original_inv_freq",
+                f"model.embed_tokens.weight -> {model_prefix}embed_tokens.weight",
+                f"model.norm.weight -> {model_prefix}norm.weight",
+                f"model.layers.$LAYER_ID.input_layernorm.weight -> {model_prefix}layers.$LAYER_ID.input_layernorm.weight",
+                f"model.layers.$LAYER_ID.post_attention_layernorm.weight -> {model_prefix}layers.$LAYER_ID.post_attention_layernorm.weight",
+                f"model.layers.$LAYER_ID.mlp.gate.e_score_correction_bias -> {model_prefix}layers.$LAYER_ID.mlp.gate.e_score_correction_bias",
+                f"model.layers.$LAYER_ID.mlp.gate.weight -> {model_prefix}layers.$LAYER_ID.mlp.gate.weight, dtype='float32'",
+                f"model.layers.$LAYER_ID.mlp.down_proj.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.down_proj.weight",
+                f"model.layers.$LAYER_ID.self_attn.o_proj.weight^T -> {model_prefix}layers.$LAYER_ID.self_attn.o_proj.weight",
+                f"model.layers.$LAYER_ID.mlp.experts.$EXPERT_ID.down_proj.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.down_proj.weight",
+                f"model.layers.$LAYER_ID.mlp.shared_experts.down_proj.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.shared_experts.down_proj.weight",
+            ]
+        }
 
-        fn = split_or_merge_func(
-            is_split=is_split,
-            tensor_parallel_degree=config.tensor_parallel_degree,
-            tensor_parallel_rank=config.tensor_parallel_rank,
-            num_attention_heads=config.num_attention_heads,
-        )
+        # attention qkv
+        if not config.fuse_attention_qkv:
+            aoa_config["aoa_statements"] += [
+                f"model.layers.$LAYER_ID.self_attn.{x}_proj.weight^T -> {model_prefix}layers.$LAYER_ID.self_attn.{x}_proj.weight"
+                for x in ("q", "k", "v")
+            ]
+        else:
+            aoa_config["aoa_statements"] += [
+                f"model.layers.$LAYER_ID.self_attn.q_proj.weight^T, model.layers.$LAYER_ID.self_attn.k_proj.weight^T, model.layers.$LAYER_ID.self_attn.v_proj.weight^T -> {model_prefix}layers.$LAYER_ID.self_attn.qkv_proj.weight, fused_qkv, num_heads={config.num_attention_heads}, num_key_value_groups={config.num_key_value_heads}",
+                f"model.layers.$LAYER_ID.self_attn.q_proj.bias, model.layers.$LAYER_ID.self_attn.k_proj.bias, model.layers.$LAYER_ID.self_attn.v_proj.bias -> {model_prefix}layers.$LAYER_ID.self_attn.qkv_proj.bias, fused_qkv, num_heads={config.num_attention_heads}, num_key_value_groups={config.num_key_value_heads}, axis=0",
+            ]
 
-        def get_tensor_parallel_split_mappings(num_layers, num_experts):
-            final_actions = {}
+        # FFN
+        if not config.fuse_attention_ffn:
+            aoa_config["aoa_statements"] += (
+                [
+                    f"model.layers.$LAYER_ID.mlp.{p}_proj.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.{p}_proj.weight"
+                    for p in ("gate", "up")
+                ]
+                + [
+                    f"model.layers.$LAYER_ID.mlp.shared_experts.{p}_proj.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.shared_experts.{p}_proj.weight"
+                    for p in ("gate", "up")
+                ]
+                + [
+                    f"model.layers.$LAYER_ID.mlp.experts.$EXPERT_ID.{p}_proj.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.{p}_proj.weight"
+                    for p in ("gate", "up")
+                ]
+            )
+        else:
+            aoa_config["aoa_statements"] += [
+                f"model.layers.$LAYER_ID.mlp.gate_proj.weight^T, model.layers.$LAYER_ID.mlp.up_proj.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.gate_up_proj.weight, fused_ffn",
+                f"model.layers.$LAYER_ID.mlp.shared_experts.gate_proj.weight^T, model.layers.$LAYER_ID.mlp.shared_experts.up_proj.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.shared_experts.gate_up_proj.weight, fused_ffn",
+                f"model.layers.$LAYER_ID.mlp.experts.$EXPERT_ID.gate_proj.weight^T, model.layers.$LAYER_ID.mlp.experts.$EXPERT_ID.up_proj.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.gate_up_proj.weight, fused_ffn",
+            ]
 
-            base_actions = {
-                "lm_head.weight": partial(fn, is_column=False),
-                # Row Linear
-                "embed_tokens.weight": partial(fn, is_column=False),
-                "layers.0.self_attn.o_proj.weight": partial(fn, is_column=False),
-            }
+        return aoa_config
 
-            if not config.vocab_size % config.tensor_parallel_degree == 0:
-                base_actions.pop("lm_head.weight")
-                base_actions.pop("embed_tokens.weight")
-            base_actions["layers.0.self_attn.sinks"] = partial(fn, is_column=False)
-            # Column Linear
-            base_actions["layers.0.self_attn.q_proj.weight"] = partial(fn, is_column=True)
-            base_actions["layers.0.self_attn.q_proj.bias"] = partial(fn, is_column=True)
+    # NOTE: These aoa_config items will be removed later. The subsequent AOA parsing module will automatically generate the reverse AOA based on the forward (from_pretrained) AOA.
+    @classmethod
+    def _gen_inv_aoa_config(cls, config: GptOssConfig):
+        model_prefix = "" if cls == cls.base_model_class else "model."
+        aoa_statements = [
+            # do cast
+            f"{model_prefix}layers.$LAYER_ID.mlp.gate.weight -> model.layers.$LAYER_ID.mlp.gate.weight, dtype='bfloat16'",
+            # do transpose
+            f"{model_prefix}layers.$LAYER_ID.mlp.down_proj.weight^T -> model.layers.$LAYER_ID.mlp.down_proj.weight",
+            f"{model_prefix}layers.$LAYER_ID.self_attn.o_proj.weight^T -> model.layers.$LAYER_ID.self_attn.o_proj.weight",
+            f"{model_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.down_proj.weight^T -> model.layers.$LAYER_ID.mlp.experts.$EXPERT_ID.down_proj.weight",
+            f"{model_prefix}layers.$LAYER_ID.mlp.shared_experts.down_proj.weight^T -> model.layers.$LAYER_ID.mlp.shared_experts.down_proj.weight",
+            f"{model_prefix}embed_tokens.weight -> model.embed_tokens.weight",
+            f"{model_prefix}norm.weight -> model.norm.weight",
+            f"{model_prefix}layers.$LAYER_ID.input_layernorm.weight -> model.layers.$LAYER_ID.input_layernorm.weight",
+            f"{model_prefix}layers.$LAYER_ID.post_attention_layernorm.weight -> model.layers.$LAYER_ID.post_attention_layernorm.weight",
+            f"{model_prefix}layers.$LAYER_ID.mlp.gate.e_score_correction_bias -> model.layers.$LAYER_ID.mlp.gate.e_score_correction_bias",
+        ]
 
-            # if we have enough num_key_value_heads to split, then split it.
-            if config.num_key_value_heads % config.tensor_parallel_degree == 0:
-                base_actions["layers.0.self_attn.k_proj.weight"] = partial(fn, is_column=True)
-                base_actions["layers.0.self_attn.v_proj.weight"] = partial(fn, is_column=True)
-                base_actions["layers.0.self_attn.k_proj.bias"] = partial(fn, is_column=True)
-                base_actions["layers.0.self_attn.v_proj.bias"] = partial(fn, is_column=True)
+        if not config.fuse_attention_qkv:
+            aoa_statements += [
+                f"{model_prefix}layers.$LAYER_ID.self_attn.{x}_proj.weight^T -> model.layers.$LAYER_ID.self_attn.{x}_proj.weight"
+                for x in ("q", "k", "v")
+            ]
+        else:
+            aoa_statements += [
+                f"{model_prefix}layers.$LAYER_ID.self_attn.qkv_proj.weight -> model.layers.$LAYER_ID.self_attn.q_proj.weight, model.layers.$LAYER_ID.self_attn.k_proj.weight, model.layers.$LAYER_ID.self_attn.v_proj.weight , fused_qkv, num_heads={config.num_attention_heads}, num_key_value_groups = {config.num_key_value_heads}",
+                f"{model_prefix}layers.$LAYER_ID.self_attn.qkv_proj.bias -> model.layers.$LAYER_ID.self_attn.q_proj.bias, model.layers.$LAYER_ID.self_attn.k_proj.bias, model.layers.$LAYER_ID.self_attn.v_proj.bias , fused_qkv, num_heads={config.num_attention_heads}, num_key_value_groups = {config.num_key_value_heads}, axis = 0",
+            ]
+            aoa_statements += [
+                f"model.layers.{layer_id}.self_attn.{x}_proj.weight^T -> model.layers.{layer_id}.self_attn.{x}_proj.weight"
+                for layer_id in range(config.num_hidden_layers)
+                for x in ("q", "k", "v")
+            ]
 
-            for key, action in base_actions.items():
-                if "layers.0." in key:
-                    for i in range(num_layers):
-                        final_actions[key.replace("layers.0.", f"layers.{i}.")] = action
-                final_actions[key] = action
-
-            return final_actions
-
-        mappings = get_tensor_parallel_split_mappings(config.num_hidden_layers, config.num_experts)
-
-        return mappings
-
-
-def prepare_sliding_window_startend_row_indices(startend_row_indices, window_size=5):
-    if startend_row_indices is None:
-        return None
-    batch_size, num_head, seq_length, bound_num = startend_row_indices.shape
-    assert bound_num <= 2, f"bound_num should be less than or equal to 2 when use sling window, but got {bound_num}"
-    sliding_window_startend_row_indices = startend_row_indices.clone()
-    for bi in range(batch_size):
-        for hi in range(num_head):
-            for j in range(seq_length):
-                sliding_window_startend_row_indices[bi, hi, j, 0] = min(
-                    startend_row_indices[bi, hi, j, 0], window_size + j
-                )
-    return sliding_window_startend_row_indices
+        if not config.fuse_attention_ffn:
+            aoa_statements += (
+                [
+                    f"{model_prefix}layers.$LAYER_ID.mlp.{y}_proj.weight^T -> model.layers.$LAYER_ID.mlp.{y}_proj.weight"
+                    for y in ("gate", "up")
+                ]
+                + [
+                    f"{model_prefix}layers.$LAYER_ID.mlp.shared_experts.{y}_proj.weight^T -> model.layers.$LAYER_ID.mlp.shared_experts.{y}_proj.weight"
+                    for y in ("gate", "up")
+                ]
+                + [
+                    f"{model_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.{y}_proj.weight^T -> model.layers.$LAYER_ID.mlp.experts.$EXPERT_ID.{y}_proj.weight"
+                    for y in ("gate", "up")
+                ]
+            )
+        else:
+            aoa_statements += [
+                f"{model_prefix}layers.0.mlp.gate_up_proj.weight -> model.layers.0.mlp.gate_proj.weight, model.layers.0.mlp.up_proj.weight, fused_ffn",
+                "model.layers.0.mlp.gate_proj.weight^T -> model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight^T -> model.layers.0.mlp.up_proj.weight",
+                f"{model_prefix}layers.$LAYER_ID.mlp.shared_experts.gate_up_proj.weight -> model.layers.$LAYER_ID.mlp.shared_experts.gate_proj.weight, model.layers.$LAYER_ID.mlp.shared_experts.up_proj.weight, fused_ffn",
+                f"{model_prefix}layers.$LAYER_ID.mlp.experts.$EXPERT_ID.gate_up_proj.weight -> model.layers.$LAYER_ID.mlp.experts.$EXPERT_ID.gate_proj.weight, model.layers.$LAYER_ID.mlp.experts.$EXPERT_ID.up_proj.weight, fused_ffn",
+            ]
+            aoa_statements += (
+                [
+                    f"model.layers.{layer_id}.mlp.shared_experts.gate_proj.weight^T -> model.layers.{layer_id}.mlp.shared_experts.gate_proj.weight"
+                    for layer_id in range(1, config.num_hidden_layers)
+                ]
+                + [
+                    f"model.layers.{layer_id}.mlp.shared_experts.up_proj.weight^T -> model.layers.{layer_id}.mlp.shared_experts.up_proj.weight"
+                    for layer_id in range(1, config.num_hidden_layers)
+                ]
+                + [
+                    f"model.layers.{layer_id}.mlp.experts.{expert_id}.gate_proj.weight^T -> model.layers.{layer_id}.mlp.experts.{expert_id}.gate_proj.weight"
+                    for layer_id in range(1, config.num_hidden_layers)
+                    for expert_id in range(config.n_routed_experts)
+                ]
+                + [
+                    f"model.layers.{layer_id}.mlp.experts.{expert_id}.up_proj.weight^T -> model.layers.{layer_id}.mlp.experts.{expert_id}.up_proj.weight"
+                    for layer_id in range(1, config.num_hidden_layers)
+                    for expert_id in range(config.n_routed_experts)
+                ]
+            )
+        aoa_config = {"aoa_statements": aoa_statements}
+        return aoa_config
 
 
 @register_base_model
@@ -710,10 +810,12 @@ class GptOssModel(GptOssPreTrainedModel):
             hidden_size=config.hidden_size,
             has_bias=config.use_bias,
             norm_eps=self.config.rms_norm_eps,
+            input_is_parallel=config.sequence_parallel,
         )
         self.rotary_emb = GptOssRotaryEmbedding(config=config)
-        if config.sequence_parallel:
-            self.norm.enable_sequence_parallel()
+        self.has_sliding_layers = getattr(
+            self.config, "sliding_window", None
+        ) is not None and "sliding_attention" in getattr(self.config, "layer_types", [])
 
     @paddle.jit.not_to_static
     def recompute_training_full(
@@ -724,7 +826,7 @@ class GptOssModel(GptOssPreTrainedModel):
         attention_mask: Tensor,
         output_attentions: bool,
         output_router_logits: bool,
-        past_key_value: Tensor,
+        past_key_values: Tensor,
         use_cache: bool,
         position_embeddings: Optional[Tuple[paddle.Tensor, paddle.Tensor]] = None,
         attn_mask_startend_row_indices=None,
@@ -741,12 +843,12 @@ class GptOssModel(GptOssPreTrainedModel):
             position_ids,
             attention_mask,
             output_attentions,
-            # output_router_logits,
-            past_key_value,
+            output_router_logits,
+            past_key_values,
             use_cache,
             position_embeddings,
             attn_mask_startend_row_indices,
-            # use_reentrant=self.config.recompute_use_reentrant,
+            use_reentrant=self.config.recompute_use_reentrant,
         )
 
         return hidden_states
@@ -758,7 +860,7 @@ class GptOssModel(GptOssPreTrainedModel):
         attention_mask: Optional[paddle.Tensor] = None,
         inputs_embeds: Optional[paddle.Tensor] = None,
         use_cache: Optional[bool] = None,
-        past_key_values: Optional[List[paddle.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
@@ -788,13 +890,9 @@ class GptOssModel(GptOssPreTrainedModel):
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
 
-        seq_length_with_past = seq_length
-        cache_length = 0
-        if past_key_values is None:
-            past_key_values = tuple([None] * len(self.layers))
-        else:
-            cache_length = past_key_values[0][0].shape[1]
-            seq_length_with_past += cache_length
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+        cache_length = past_key_values.get_seq_length() if past_key_values is not None else 0
 
         if inputs_embeds is None:
             # [bs, seq_len, dim]
@@ -807,47 +905,29 @@ class GptOssModel(GptOssPreTrainedModel):
             # [seq_len * bs / n, num_head * head_dim] (n is mp parallelism)
             inputs_embeds = ScatterOp.apply(inputs_embeds)
 
-        # embed positions
-        if attn_mask_startend_row_indices is not None:
-            attention_mask = None
-            causal_mask_mapping = {}
-            attn_mask_startend_row_indices_mapping = {}
-            causal_mask_mapping["full_attention"] = None
-            causal_mask_mapping["sliding_attention"] = None
-            attn_mask_startend_row_indices_mapping["full_attention"] = attn_mask_startend_row_indices
-            attn_mask_startend_row_indices_mapping["sliding_attention"] = prepare_sliding_window_startend_row_indices(
-                attn_mask_startend_row_indices, window_size=self.config.sliding_window
-            )
-        else:
-            # [bs, seq_len]
-            attention_mask = (
-                paddle.ones((batch_size, seq_length_with_past), dtype=paddle.bool)
-                if attention_mask is None
-                else attention_mask
-            )
-            causal_mask_mapping = {}
-            attn_mask_startend_row_indices_mapping = {}
-            attn_mask_startend_row_indices_mapping["full_attention"] = None
-            attn_mask_startend_row_indices_mapping["sliding_attention"] = None
+        # Prepare mask arguments
+        mask_kwargs = {
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "batch_size": batch_size,
+            "seq_length": seq_length,
+            "cache_length": cache_length,
+            "attention_mask": attention_mask,
+            "attn_mask_startend_row_indices": attn_mask_startend_row_indices,
+            "prepare_decoder_attention_mask": self._prepare_decoder_attention_mask,
+        }
+        # Create the causal mask and row indices
+        full_mask, full_indices = create_causal_mask_and_row_indices(**mask_kwargs)
 
-            # full_attention
-            causal_mask = self._prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
-                input_shape=(batch_size, seq_length),
-                past_key_values_length=cache_length,
-                dtype=inputs_embeds.dtype,
-            )  # [bs, 1, seq_len, seq_len]
-            causal_mask_mapping["full_attention"] = causal_mask
+        causal_mask_mapping = {"full_attention": full_mask}
+        attn_mask_startend_row_indices_mapping = {"full_attention": full_indices}
 
-            # sliding_attention
-            causal_mask = self._prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
-                input_shape=(batch_size, seq_length),
-                past_key_values_length=cache_length,
-                dtype=inputs_embeds.dtype,
-                sliding_window_size=self.config.sliding_window,
-            )
-            causal_mask_mapping["sliding_attention"] = causal_mask
+        # if model has sliding layer
+        if self.has_sliding_layers:
+            (
+                causal_mask_mapping["sliding_attention"],
+                attn_mask_startend_row_indices_mapping["sliding_attention"],
+            ) = create_sliding_window_causal_mask_and_row_indices(**mask_kwargs)
 
         if position_ids is None:
             position_ids = paddle.arange(seq_length, dtype="int64").expand((batch_size, seq_length))
@@ -859,12 +939,10 @@ class GptOssModel(GptOssPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
-        next_decoder_cache = () if use_cache else None
 
         for idx, (decoder_layer) in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             has_gradient = not hidden_states.stop_gradient
             if self.config.recompute and self.config.recompute_granularity == "full" and has_gradient:
@@ -878,7 +956,7 @@ class GptOssModel(GptOssPreTrainedModel):
                     position_ids=position_ids,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    past_key_value=past_key_value,
+                    past_key_values=past_key_values,
                     use_cache=use_cache,
                     position_embeddings=position_embeddings,
                 )
@@ -892,13 +970,11 @@ class GptOssModel(GptOssPreTrainedModel):
                     position_ids=position_ids,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    past_key_value=past_key_value,
+                    past_key_values=past_key_values,
                     use_cache=use_cache,
                     position_embeddings=position_embeddings,
                 )
 
-            # # NOTE: clear outdate cache after it has been used for memory saving
-            # past_key_value = past_key_values[idx] = None
             if isinstance(layer_outputs, (tuple, list)):
                 hidden_states = layer_outputs[0]
             else:
@@ -906,9 +982,6 @@ class GptOssModel(GptOssPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-
-            if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
@@ -918,18 +991,12 @@ class GptOssModel(GptOssPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
-
         if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
-                if v is not None
-            )
+            return tuple(v for v in [hidden_states, past_key_values] if v is not None)
 
         return MoEModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits,
@@ -963,7 +1030,7 @@ def load_balancing_loss_func(
 
     if isinstance(gate_logits, tuple):
         compute_device = gate_logits[0].device
-        concatenated_gate_logits = paddle.concat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+        concatenated_gate_logits = paddle.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
 
     routing_weights = F.softmax(concatenated_gate_logits, dim=-1)
 
@@ -1081,32 +1148,6 @@ class GptOssForCausalLM(GptOssPreTrainedModel):
             "position_ids": paddle.static.InputSpec(shape=[None, None], dtype="int64"),
         }
 
-    @staticmethod
-    def update_model_kwargs_for_generation(outputs, model_kwargs, is_encoder_decoder=False):
-        # update cache
-        if isinstance(outputs, tuple) and len(outputs) > 1 and not isinstance(outputs[1], paddle.Tensor):
-            model_kwargs["past_key_values"] = outputs[1]
-        if isinstance(outputs, MoECausalLMOutputWithPast) and "past_key_values" in outputs:
-            model_kwargs["past_key_values"] = outputs.past_key_values
-        # update position_ids
-        if "position_ids" in model_kwargs and model_kwargs["position_ids"] is not None:
-            position_ids = model_kwargs["position_ids"]
-            model_kwargs["position_ids"] = paddle.concat([position_ids, position_ids[..., -1:] + 1], axis=-1)
-        if not is_encoder_decoder and "attention_mask" in model_kwargs:
-            # TODO: support attention mask for other models
-            attention_mask = model_kwargs["attention_mask"]
-            if len(attention_mask.shape) == 2:
-                model_kwargs["attention_mask"] = paddle.concat(
-                    [attention_mask, paddle.ones([attention_mask.shape[0], 1], dtype=attention_mask.dtype)],
-                    axis=-1,
-                )
-            elif len(attention_mask.shape) == 4:
-                model_kwargs["attention_mask"] = paddle.concat(
-                    [attention_mask, paddle.ones([*attention_mask.shape[:3], 1], dtype=attention_mask.dtype)],
-                    axis=-1,
-                )[:, :, -1:, :]
-        return model_kwargs
-
     def forward(
         self,
         input_ids: paddle.Tensor = None,
@@ -1116,7 +1157,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel):
         labels: Optional[paddle.Tensor] = None,
         loss_mask: Optional[paddle.Tensor] = None,
         use_cache: Optional[bool] = None,
-        past_key_values: Optional[List[paddle.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
@@ -1154,32 +1195,13 @@ class GptOssForCausalLM(GptOssPreTrainedModel):
             attn_mask_startend_row_indices=attn_mask_startend_row_indices,
         )
         hidden_states = outputs[0]  # [bs, seq_len, dim]
-        # if labels is None，means we need full output, instead of tensor_parallel_output
-        # tensor_parallel_output is together with ParallelCrossEntropy
-        tensor_parallel_output = self.config.tensor_parallel_output and self.config.tensor_parallel_degree > 1
-        if labels is not None and self.config.use_fused_linear_cross_entropy:
-            from paddlenlp_kernel.triton.cut_cross_entropy import linear_cross_entropy
 
-            assert (
-                self.config.tensor_parallel_degree <= 1
-            ), "The argument `use_fused_linear_cross_entropy` is imcompatiable with tensor parallel "
-            # todo :hidden_states[:, slice_indices, :]
-            masked_lm_loss = linear_cross_entropy(hidden_states, self.lm_head.weight, targets=labels)
-            binary_sequence = paddle.where(
-                masked_lm_loss > 0, paddle.ones_like(masked_lm_loss), paddle.zeros_like(masked_lm_loss)
-            )
-            count = paddle.sum(binary_sequence)
-            if count == 0:
-                loss = paddle.sum(masked_lm_loss * binary_sequence)
-            else:
-                loss = paddle.sum(masked_lm_loss * binary_sequence) / count
-            logits = None
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :], tensor_parallel_output=tensor_parallel_output)
-            loss = None
-            if labels is not None:
-                loss, _ = self.criterion(logits, labels)
+        logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            loss, _ = self.criterion(logits, labels)
+
         aux_loss = None
         if output_router_logits:
             aux_loss = load_balancing_loss_func(
@@ -1216,6 +1238,8 @@ class GptOssForCausalLMPipe(GeneralModelForCausalLMPipe):
     _keep_in_fp32_modules = GptOssModel._keep_in_fp32_modules
     _tied_weights_keys = ["lm_head.weight"]
     transpose_weight_keys = GptOssModel.transpose_weight_keys
+    _gen_aoa_config = GptOssForCausalLM._gen_aoa_config
+    _gen_inv_aoa_config = GptOssForCausalLM._gen_inv_aoa_config
 
 
 __all__ = ["GptOssForCausalLM", "GptOssModel", "GptOssPreTrainedModel", "GptOssForCausalLMPipe"]

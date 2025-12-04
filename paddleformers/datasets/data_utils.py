@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Useful data utility."""
 
 import json
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
@@ -23,70 +23,19 @@ from paddleformers.utils.env import NONE_CHAT_TEMPLATE
 
 from ..utils.log import logger
 
-INF = 1000000
-OPT_MULTI_OF = 256
+
+def round_up_to_multiple_of_8(n):
+    """round up to multiple of 8"""
+    return (n + 7) & ~7
 
 
-@dataclass
-class Example:
-    """Data format for raw SFT (Supervised Fine-Tuning) examples."""
-
-    request: Dict
-    system: str
-    label: List[int]
-    is_system: int
-    source: str
-    is_function_call: bool = False
-
-
-def pad_batch_data(
-    insts,
-    pad_idx=0,
-    return_pos=False,
-    max_seq_len=None,
-    return_input_mask=False,
-    return_max_len=False,
-    return_num_token=False,
-    return_seq_lens=False,
-):
-    """
-    Pad the instances to the max sequence length in batch, and generate the
-    corresponding position data and attention bias.
-    """
-    return_list = []
-    max_len = max_seq_len if max_seq_len is not None else max(len(inst) for inst in insts)
-    # Any token included in dict can be used to pad, since the paddings' loss
-    # will be masked out by weights and make no effect on parameter gradients.
-
-    inst_data = np.array([inst + list([pad_idx] * (max_len - len(inst))) for inst in insts])
-    return_list += [inst_data.astype("int64").reshape([-1, max_len])]
-
-    # position data
-    if return_pos:
-        inst_pos = np.array([list(range(0, len(inst))) + [pad_idx] * (max_len - len(inst)) for inst in insts])
-
-        return_list += [inst_pos.astype("int64").reshape([-1, max_len])]
-
-    if return_input_mask:
-        # This is used to avoid attention on paddings.
-        input_mask_data = np.array([[1] * len(inst) + [0] * (max_len - len(inst)) for inst in insts])
-        input_mask_data = np.expand_dims(input_mask_data, axis=-1)
-        return_list += [input_mask_data.astype("float32")]
-
-    if return_max_len:
-        return_list += [max_len]
-
-    if return_num_token:
-        num_token = 0
-        for inst in insts:
-            num_token += len(inst)
-        return_list += [num_token]
-
-    if return_seq_lens:
-        seq_lens = np.array([len(inst) for inst in insts])
-        return_list += [seq_lens.astype("int64").reshape([-1, 1])]
-
-    return return_list if len(return_list) > 1 else return_list[0]
+def print_debug_info(tokenizer, data, label):
+    """Helper function to print tokenized data debug info"""
+    try:
+        decoded = tokenizer.decode(data)
+        logger.info(f"[dataset debug] {label}: {decoded}")
+    except (TypeError, ValueError, OverflowError) as e:
+        logger.info(f"[dataset debug] tokenizer decode {label} error: {str(e)}")
 
 
 def convert_to_tokens_for_pt(
@@ -192,6 +141,43 @@ def convert_to_input_ids(
             raise ValueError(f"Unsupported data format: {data_format}")
         num_input_tokens += len(input_ids[-1])
     return input_ids, num_input_tokens
+
+
+def function_call_chat_template(tokenizer, messages, tools):
+    history = messages[:-1]
+    input_dict = dict()
+    input_dict["messages"] = history
+    if tools is not None:
+        if isinstance(tools, str):
+            tools = json.loads(tools)
+        input_dict["tools"] = tools
+    history_str = tokenizer.apply_chat_template(
+        input_dict,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    history_len = len(history_str)
+    input_dict["messages"] = messages
+    all_str = tokenizer.apply_chat_template(
+        input_dict,
+        add_generation_prompt=False,
+        tokenize=False,
+    )
+    # (21b think model) remove generation content
+    s = "<|im_end|>\n\n<|im_start|>assistant\n<think>\n"
+    if all_str.endswith(s):
+        all_str = all_str[: -len(s)]
+    response_str = all_str[history_len:]
+    history_id = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(history_str))
+    response_id = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(response_str))
+    return [history_id, response_id]
+
+
+def postprocess_fc_sequence(tokenizer, example):
+    messages = example["messages"]
+    tools = example["tools"]
+    encoded_messages = [function_call_chat_template(tokenizer, messages, tools)]
+    return encoded_messages
 
 
 def estimate_training(train_dataset, data_args, training_args, model_args):

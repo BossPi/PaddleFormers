@@ -33,6 +33,7 @@ def prepare_default_config(config):
     config.num_key_value_heads = 16
     config.intermediate_size = config.hidden_size
     config.word_embed_proj_dim = 512
+    config.head_dim = config.hidden_size // config.num_attention_heads
     return config
 
 
@@ -154,7 +155,7 @@ def _test_fast_ffn():
 
                 concat_fn = np.concatenate
                 if isinstance(fuse_params[0], paddle.Tensor):
-                    concat_fn = paddle.concat
+                    concat_fn = paddle.cat
 
                 if convert_fast_ffn:
                     # fast_ffn

@@ -26,6 +26,7 @@
 
 
 import paddle
+from paddle.distributed.auto_parallel.ring_attention import shard_seq_load_balance
 from paddle.distributed.fleet import fleet
 
 
@@ -47,7 +48,7 @@ def split_inputs_sequence_dim_load_balance(inputs, rank=None, degree=None):
         assert len(data.shape) == 2, f"data dims should be 2, but shaped: {data.shape}"
         sliced_datas = paddle.split(data, num_or_sections=degree * 2, axis=-1)
         sliced_data0, sliced_data1 = sliced_datas[rank], sliced_datas[degree * 2 - 1 - rank]
-        return paddle.concat([sliced_data0, sliced_data1], axis=-1)
+        return paddle.cat([sliced_data0, sliced_data1], axis=-1)
 
     if isinstance(inputs, paddle.Tensor):
         return do_split_sequence_dim_load_balance(inputs, rank, degree)
@@ -59,6 +60,25 @@ def split_inputs_sequence_dim_load_balance(inputs, rank=None, degree=None):
         res = []
         for tensor in inputs:
             res.append(do_split_sequence_dim_load_balance(tensor, rank, degree))
+    else:
+        raise ValueError(f"the inputs should be a list or a dict, but is type: {type(inputs)}")
+    return res
+
+
+def auto_split_sequence_dim_load_balance(inputs):
+    """
+    for auto_parallel mode
+    """
+    if isinstance(inputs, paddle.Tensor):
+        return shard_seq_load_balance(inputs, 1)
+    elif isinstance(inputs, dict):
+        res = {}
+        for k, tensor in inputs.items():
+            res[k] = shard_seq_load_balance(tensor, 1)
+    elif isinstance(inputs, list):
+        res = []
+        for tensor in inputs:
+            res.append(shard_seq_load_balance(tensor, 1))
     else:
         raise ValueError(f"the inputs should be a list or a dict, but is type: {type(inputs)}")
     return res

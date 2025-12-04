@@ -176,7 +176,7 @@ class TestAttentionInterface(unittest.TestCase):
         # Step 5: Prepare and concatenate the sink logits. The sink is a special token
         # that every other token can attend to, preventing the attention from collapsing.
         sinks = sink.reshape(shape=[1, -1, 1, 1]).expand(shape=[query_states.shape[0], -1, query_states.shape[-2], -1])
-        combined_logits = paddle.concat(x=[attn_weights, sinks], axis=-1)
+        combined_logits = paddle.cat(x=[attn_weights, sinks], axis=-1)
 
         # Step 6: Apply softmax over the combined logits (scores + sink)
         combined_logits = combined_logits - paddle.max(combined_logits, axis=-1, keepdim=True)
@@ -204,22 +204,41 @@ class TestAttentionInterface(unittest.TestCase):
         """
         # Test the basic eager implementation
         eager_interface = ALL_ATTENTION_FUNCTIONS["eager"]
-        eager_interface(self, self.query, self.key, self.value, scaling=self.scaling)
+        eager_interface(
+            self,
+            self.query.transpose([0, 2, 1, 3]),
+            self.key.transpose([0, 2, 1, 3]),
+            self.value.transpose([0, 2, 1, 3]),
+            scaling=self.scaling,
+        )
 
         # Test the SDPA implementation (without and with sink)
         sdpa_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
-        sdpa_interface(self, self.query, self.key, self.value, scaling=self.scaling)
-        sdpa_interface(self, self.query, self.key, self.value, sink=self.sink, scaling=self.scaling)
+        sdpa_interface(
+            self,
+            self.query.transpose([0, 2, 1, 3]),
+            self.key.transpose([0, 2, 1, 3]),
+            self.value.transpose([0, 2, 1, 3]),
+            scaling=self.scaling,
+        )
+        sdpa_interface(
+            self,
+            self.query.transpose([0, 2, 1, 3]),
+            self.key.transpose([0, 2, 1, 3]),
+            self.value.transpose([0, 2, 1, 3]),
+            sink=self.sink,
+            scaling=self.scaling,
+        )
 
         # Test the FlashMask implementation with its specific arguments
         flashmask_interface = ALL_ATTENTION_FUNCTIONS["flashmask"]
         flashmask_interface(
             self,
-            self.query,
-            self.key,
-            self.value,
+            self.query.transpose([0, 2, 1, 3]),
+            self.key.transpose([0, 2, 1, 3]),
+            self.value.transpose([0, 2, 1, 3]),
             scaling=self.scaling,
-            attn_mask_start_row_indices=self.startend_row_indices,
+            attn_mask_startend_row_indices=self.startend_row_indices,
             sink=self.sink,
         )
 
@@ -233,7 +252,13 @@ class TestAttentionInterface(unittest.TestCase):
         # Get the output from the optimized SDPA implementation
         sdpa_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
         sdpa_output, _ = sdpa_interface(
-            self, self.query, self.key, self.value, sink=self.sink, scaling=self.scaling, is_causal=True
+            self,
+            self.query.transpose([0, 2, 1, 3]),
+            self.key.transpose([0, 2, 1, 3]),
+            self.value.transpose([0, 2, 1, 3]),
+            sink=self.sink,
+            scaling=self.scaling,
+            is_causal=True,
         )
 
         # Create the ground truth dense causal mask for the naive implementation
@@ -257,11 +282,11 @@ class TestAttentionInterface(unittest.TestCase):
         flashmask_interface = ALL_ATTENTION_FUNCTIONS["flashmask"]
         flashmask_output, _ = flashmask_interface(
             self,
-            self.query,
-            self.key,
-            self.value,
+            self.query.transpose([0, 2, 1, 3]),
+            self.key.transpose([0, 2, 1, 3]),
+            self.value.transpose([0, 2, 1, 3]),
             scaling=self.scaling,
-            attn_mask_start_row_indices=self.startend_row_indices,
+            attn_mask_startend_row_indices=self.startend_row_indices,
             sink=self.sink,
             is_causal=False,
         )

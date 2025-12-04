@@ -86,7 +86,7 @@ class DPOCriterion(nn.Layer):
             rejected_logratios = policy_rejected_logps - reference_rejected_logps
             # As described in the KTO report, the KL term for chosen (rejected) is
             # estimated using the rejected (chosen) half.
-            loss = paddle.concat(
+            loss = paddle.cat(
                 (
                     1 - F.sigmoid(self.dpo_config.beta * (chosen_logratios - rejected_KL)),
                     1 - F.sigmoid(self.dpo_config.beta * (chosen_KL - rejected_logratios)),
@@ -268,6 +268,12 @@ class DPOCriterion(nn.Layer):
             rejected_response_length = response_indexs[:, 3] - response_indexs[:, 2]
             chosen_logps /= chosen_response_length.astype("float32")
             rejected_logps /= rejected_response_length.astype("float32")
+        elif self.dpo_config.normalize_logps:
+            avg_response_length = (response_indexs[:, 3] - response_indexs[:, 1]) / 2
+            chosen_response_length = response_indexs[:, 2] - response_indexs[:, 1]
+            rejected_response_length = response_indexs[:, 3] - response_indexs[:, 2]
+            chosen_logps *= avg_response_length / chosen_response_length.astype("float32")
+            rejected_logps *= avg_response_length / rejected_response_length.astype("float32")
         return chosen_logps, rejected_logps, sft_loss * self.dpo_config.sft_loss_ratio
 
     def forward(

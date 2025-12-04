@@ -233,219 +233,6 @@ class TestUnifiedCheckpointBase(TestMultipleGpus):
             np.testing.assert_allclose(res[0], res[1], self.rtol)
 
 
-@pytest.mark.xdist_group(name="UC")
-class TestUnifiedCheckpointFull(TestUnifiedCheckpointBase):
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testTP8(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["TP8"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testTP4DP2(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["TP4DP2"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testTP4Sharding2(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["TP4Sharding2"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testTP2PP4(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["TP2PP4"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testPP8(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["PP8"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testPP4DP2(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["PP4DP2"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testPP4Sharding2(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["PP4Sharding2"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testSharding8S1(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["Sharding8S1"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testSharding8S2(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["Sharding8S2"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testSharding4S1DP2(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["Sharding4S1DP2"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testSharding4S2DP2(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["Sharding4S2DP2"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testSharding2S1DP4(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["Sharding2S1DP4"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testSharding2S2DP4(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["Sharding2S2DP4"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-    @skip_for_none_ce_case
-    @require_paddle_at_least_8_gpu
-    def testDP8(self):
-        remove_logs()
-        remove_ckpt(pretrain_arguments["output_dir"])
-
-        train_args = self.configs["DP8"]
-        self.runfirst(train_args)
-        self.rerun(train_args)
-
-        if self.need_allclose:
-            res = check_acc()
-            assert len(res) == 2
-            np.testing.assert_allclose(res[0], res[1], self.rtol)
-
-
 @pytest.mark.skipif(True, reason="Skip for None CE")
 class TestUnifiedCheckpointOnN2C4(TestUnifiedCheckpointBase):
     def setUp(self):
@@ -460,30 +247,8 @@ class TestUnifiedCheckpointOnN2C4(TestUnifiedCheckpointBase):
         self.run_n2c4(self.run_pretrain_file, **train_args)
 
 
-# Test Unified Checkpoint Hybrid Parallel Strategy Convert on N1C8
-@pytest.mark.skipif(True, reason="Skip for failed")
-class TestUnifiedCheckpointOnN1C8Dynamic(TestUnifiedCheckpointFull):
-    def setUp(self):
-        super().setUp()
-        self.need_allclose = False
-        self.rtol = 1e-4
-        self.k = MAX_CONVERT_CONFIGS  # max: 16, min: 1
-
-    def runfirst(self, train_args):
-        self.run_n1c8(self.run_pretrain_file, **train_args)
-
-    def rerun(self, train_args):
-        configs = random_sample(self.configs.keys(), k=self.k)
-        for config_name in configs:
-            print(f"Rerun using {config_name}")
-            config = self.configs[config_name]
-            self.run_n1c8(self.run_pretrain_file, **config)
-            res = check_acc()
-            np.testing.assert_allclose(res[0], res[-1], rtol=self.rtol)
-
-
 # Test Unified Checkpoint Hybrid Parallel Strategy Convert on N2C4
-@pytest.mark.skipif(True, reason="Skip for failed")
+@pytest.mark.skipif(True, reason="Skip for unsupoort")
 class TestUnifiedCheckpointOnN2C4Dynamic(TestUnifiedCheckpointBase):
     def setUp(self):
         super().setUp()
@@ -505,7 +270,7 @@ class TestUnifiedCheckpointOnN2C4Dynamic(TestUnifiedCheckpointBase):
 
 
 # Test Unified Checkpoint Hybrid Parallel Strategy and Devices Convert Between N1C8 and N2C4
-@pytest.mark.skipif(True, reason="Skip for failed")
+@pytest.mark.skipif(True, reason="Skip for unsupoort")
 class TestUnifiedCheckpointOnN1C8ToN2C4(TestUnifiedCheckpointBase):
     def setUp(self):
         super().setUp()
@@ -527,7 +292,7 @@ class TestUnifiedCheckpointOnN1C8ToN2C4(TestUnifiedCheckpointBase):
             np.testing.assert_allclose(res[0], res[-1], rtol=self.rtol)
 
 
-@pytest.mark.skipif(True, reason="Skip for failed")
+@pytest.mark.skipif(True, reason="Skip for unsupoort")
 class TestUnifiedCheckpointOnN2C4ToN1C8(TestUnifiedCheckpointBase):
     def setUp(self):
         super().setUp()
@@ -550,7 +315,6 @@ class TestUnifiedCheckpointOnN2C4ToN1C8(TestUnifiedCheckpointBase):
 
 
 # Test Unified Checkpoint Config on N1C8
-@pytest.mark.skipif(True, reason="Skip for None CE")
 class TestUnifiedCheckpointOnN1C8SkipSaveModelWeight(TestUnifiedCheckpointBase):
     def setUp(self):
         super().setUp()
@@ -570,7 +334,6 @@ class TestUnifiedCheckpointOnN1C8SkipSaveModelWeight(TestUnifiedCheckpointBase):
         self.run_n1c8(self.run_pretrain_file, **train_args)
 
 
-@pytest.mark.skipif(True, reason="Skip for None CE")
 class TestUnifiedCheckpointOnN1C8MasterWeightCompatibleO1ToO2(TestUnifiedCheckpointBase):
     def setUp(self):
         super().setUp()
@@ -591,7 +354,6 @@ class TestUnifiedCheckpointOnN1C8MasterWeightCompatibleO1ToO2(TestUnifiedCheckpo
         self.run_n1c8(self.run_pretrain_file, **train_args)
 
 
-@pytest.mark.skipif(True, reason="Skip for None CE")
 class TestUnifiedCheckpointOnN1C8MasterWeightCompatibleO2ToO1(TestUnifiedCheckpointBase):
     def setUp(self):
         super().setUp()
@@ -612,7 +374,6 @@ class TestUnifiedCheckpointOnN1C8MasterWeightCompatibleO2ToO1(TestUnifiedCheckpo
         self.run_n1c8(self.run_pretrain_file, **train_args)
 
 
-@pytest.mark.skipif(True, reason="Skip for None CE")
 class TestUnifiedCheckpointOnN1C8CheckpointCompatible(TestUnifiedCheckpointBase):
     def setUp(self):
         super().setUp()
@@ -629,7 +390,6 @@ class TestUnifiedCheckpointOnN1C8CheckpointCompatible(TestUnifiedCheckpointBase)
         self.run_n1c8(self.run_pretrain_file, **train_args)
 
 
-@pytest.mark.skipif(True, reason="Skip for None CE")
 class TestPaddleCheckpointOnN1C8Reset(TestUnifiedCheckpointBase):
     def setUp(self):
         super().setUp()
@@ -646,7 +406,7 @@ class TestPaddleCheckpointOnN1C8Reset(TestUnifiedCheckpointBase):
         self.run_n1c8(self.run_pretrain_file, **train_args)
 
 
-@pytest.mark.skipif(True, reason="Skip for None CE")
+@pytest.mark.skipif(True, reason="Skip for unsupoort")
 class TestPaddleCheckpointOnN1C2Reset(TestMultipleGpus):
     def setUp(self):
         self.configs = get_pretrain_arguments(pretrain_arguments)
@@ -671,7 +431,6 @@ class TestPaddleCheckpointOnN1C2Reset(TestMultipleGpus):
         train_args["unified_checkpoint"] = 0
         self.run_n1c2(self.run_pretrain_file, **train_args)
 
-    @skip_for_none_ce_case
     @require_paddle_at_least_2_gpu
     def testTP2(self):
         remove_logs()
@@ -688,7 +447,7 @@ class TestPaddleCheckpointOnN1C2Reset(TestMultipleGpus):
             np.testing.assert_allclose(res[0], res[1], self.rtol)
 
 
-@pytest.mark.skipif(True, reason="Skip for None CE")
+@pytest.mark.skipif(True, reason="Skip for unsupoort")
 class TestUnifiedCheckpointOnN1C2Reset(TestMultipleGpus):
     def setUp(self):
         self.configs = get_pretrain_arguments(pretrain_arguments)
@@ -749,7 +508,6 @@ class TestUnifiedCheckpointOnN1C2Reset(TestMultipleGpus):
             assert len(res) == 2
             np.testing.assert_allclose(res[0], res[1], self.rtol)
 
-    @skip_for_none_ce_case
     @require_paddle_at_least_2_gpu
     def testFileLists(self):
         remove_logs()
@@ -788,7 +546,6 @@ class TestUnifiedCheckpointOnN1C2Reset(TestMultipleGpus):
             np.testing.assert_allclose(res[0], res[1], self.rtol)
 
 
-@pytest.mark.skipif(True, reason="Skip for None CE")
 class TestUnifiedCheckpointOnN1C8AsyncSaveToDisk(TestUnifiedCheckpointBase):
     def setUp(self):
         super().setUp()
@@ -1132,42 +889,3 @@ class TestUnifiedCheckpointOnN2C4ToN1C8AsyncSaveToDisk(TestUnifiedCheckpointBase
             self.run_n1c8(self.run_pretrain_file, **config)
             res = check_acc()
             np.testing.assert_allclose(res[0], res[-1], rtol=self.rtol)
-
-
-@pytest.mark.skipif(True, reason="Skip for None CE")
-class TestUnifiedCheckpointOnN1C8SaveLoadSpeed(TestUnifiedCheckpointFull):
-    def setUp(self):
-        super().setUp()
-        for config_key in self.configs:
-            self.configs[config_key]["skip_profile_timer"] = 0
-            self.configs[config_key]["unified_checkpoint"] = 1
-            self.configs[config_key]["save_steps"] = 6
-            self.configs[config_key]["unified_checkpoint_config"] = "skip_save_model_weight master_weight_compatible"
-
-        self.need_allclose = False
-        self.rtol = 1e-7
-
-    def runfirst(self, train_args):
-        self.run_n1c8(self.run_pretrain_file, log_dir="log_uc", **train_args)
-
-    def rerun(self, train_args):
-        self.run_n1c8(self.run_pretrain_file, log_dir="log_uc", **train_args)
-
-
-@pytest.mark.skipif(True, reason="Skip for None CE")
-class TestPaddleCheckpointOnN1C8SaveLoadSpeed(TestUnifiedCheckpointFull):
-    def setUp(self):
-        super().setUp()
-        for config_key in self.configs:
-            self.configs[config_key]["skip_profile_timer"] = 0
-            self.configs[config_key]["unified_checkpoint"] = 0
-            self.configs[config_key]["save_steps"] = 6
-
-        self.need_allclose = False
-        self.rtol = 1e-7
-
-    def runfirst(self, train_args):
-        self.run_n1c8(self.run_pretrain_file, log_dir="log_pd", **train_args)
-
-    def rerun(self, train_args):
-        self.run_n1c8(self.run_pretrain_file, log_dir="log_pd", **train_args)

@@ -51,7 +51,7 @@ from ...utils.log import logger
 from .. import linear_utils
 from ..linear_utils import Linear
 from ..long_sequence_strategies import LongSequenceStrategies
-from ..model_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, ModelOutput
+from ..model_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ..model_utils import PretrainedModel
 from ..utils import caculate_llm_per_token_flops
 from .configuration import QWenConfig
@@ -259,6 +259,7 @@ class QWenAttention(nn.Layer):
                     attn_mask=attention_mask,
                     is_causal=attention_mask is None,
                     enable=skip_recompute,
+                    enable_gqa=True,
                 )
                 attn_weights = None
 
@@ -375,8 +376,8 @@ class QWenAttention(nn.Layer):
 
         if layer_past is not None:
             past_key, past_value = layer_past[0], layer_past[1]
-            key = paddle.concat([past_key, key], axis=1)
-            value = paddle.concat([past_value, value], axis=1)
+            key = paddle.cat([past_key, key], axis=1)
+            value = paddle.cat([past_value, value], axis=1)
 
         if use_cache:
             present = (key, value)
@@ -821,7 +822,7 @@ class QWenModel(QWenPretrainedModel):
         # casual mask
         casual_mask = paddle.tril(paddle.ones([batch_size, 1, seq_length, seq_length], dtype="bool"))
         if past_length > 0:
-            casual_mask = paddle.concat(
+            casual_mask = paddle.cat(
                 [paddle.ones([batch_size, 1, seq_length, past_length], dtype="bool"), casual_mask], axis=-1
             )
 
@@ -1065,39 +1066,6 @@ class QWenForCausalLM(QWenPretrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    @staticmethod
-    def update_model_kwargs_for_generation(outputs, model_kwargs, is_encoder_decoder=False):
-        # Update the model inputs during generation.
-        # Note that If `token_type_ids` and `attention_mask` in `model_kwargs`
-        # and they contain pad value, the result vectors updated by this method
-        # may be different from expected. In this case, you need to rewrite the
-        # method.
-
-        # update cache
-        if isinstance(outputs, tuple) and len(outputs) > 1 and not isinstance(outputs[1], paddle.Tensor):
-            model_kwargs["cache"] = outputs[1]
-            model_kwargs["past_key_values"] = outputs[1]
-
-        if isinstance(outputs, ModelOutput) and "past_key_values" in outputs:
-            model_kwargs["cache"] = outputs.past_key_values
-            model_kwargs["past_key_values"] = outputs.past_key_values
-
-        if "position_ids" in model_kwargs and model_kwargs["position_ids"] is not None:
-            position_ids = model_kwargs["position_ids"]
-            model_kwargs["position_ids"] = paddle.concat([position_ids, position_ids[..., -1:] + 1], axis=-1)
-
-        # update attention_mask
-        if not is_encoder_decoder and "attention_mask" in model_kwargs:
-            attention_mask = model_kwargs["attention_mask"]
-            if attention_mask is not None and len(attention_mask.shape) == 2:
-                model_kwargs["attention_mask"] = paddle.concat(
-                    [attention_mask, paddle.ones([attention_mask.shape[0], 1], dtype=attention_mask.dtype)], axis=-1
-                )
-            else:
-                model_kwargs["attention_mask"] = None
-
-        return model_kwargs
-
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         attention_mask = kwargs.get("attention_mask", None)
         position_ids = kwargs.get("position_ids", None)
@@ -1224,7 +1192,7 @@ class RotaryEmbedding(nn.Layer):
             seq = paddle.arange(self._seq_len_cached)
             with paddle.amp.auto_cast(enable=False):
                 freqs = paddle.outer(seq.astype(self.inv_freq.dtype), self.inv_freq)
-            emb = paddle.concat([freqs, freqs], axis=-1)
+            emb = paddle.cat([freqs, freqs], axis=-1)
             self.cos_cached = emb.cos()[None, :, None, :]
             self.sin_cached = emb.sin()[None, :, None, :]
 
@@ -1242,7 +1210,7 @@ def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
-    return paddle.concat([-x2, x1], axis=-1)
+    return paddle.cat([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):

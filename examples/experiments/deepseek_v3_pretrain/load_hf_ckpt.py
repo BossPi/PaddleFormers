@@ -71,6 +71,7 @@ def paddle_name_to_hf_names_ds_v2(paddle_name: str) -> List[str]:
 
     m = _LAYER_RE_v2.match(paddle_name)
     if not m:
+        logger.warning("not match here !!", paddle_name)
         return []
 
     rest = m.group(2) or ""
@@ -125,15 +126,6 @@ def paddle_name_to_hf_names_ds_v2(paddle_name: str) -> List[str]:
 
 
 def paddle_name_to_hf_names(paddle_name: str) -> List[str]:
-    """
-    Convert Paddle model parameter names to Hugging Face format name lists
-
-    Args:
-        paddle_name: Parameter name in Paddle format
-
-    Returns:
-        List of parameter names in Hugging Face format (may be split into multiple parameters)
-    """
     if paddle_name == "_layers.local_shared_layers.DeepseekV2_shared_weight.embed_tokens.weight":
         return ["model.embed_tokens.weight"]
 
@@ -143,6 +135,7 @@ def paddle_name_to_hf_names(paddle_name: str) -> List[str]:
     m = _LAYER_RE.match(paddle_name)
 
     if not m:
+        logger.warning("not match here !!", paddle_name)
         return []
     else:
         rest = m.group(3) or ""
@@ -201,18 +194,11 @@ def paddle_name_to_hf_names(paddle_name: str) -> List[str]:
 
 
 def _get_hf_prefix(segment_id: int, id_in_segment: int) -> str:
-    """Generate hierarchical prefix in Hugging Face format"""
-    # Special layer mappings
-    # special_cases = {(0, 0): "model", (60, 2): "model.layers.61", (60, 3): "model"}
-    # special_cases = {(0, 0): "model", (28, 2): "model.layers.61", (28, 3): "model"}
-    # special_cases = {(0, 0): "model", (28, 2): "model.layers.61", (4, 1): "model"}
-    # special_cases = {(0, 0): "model",  (28, 2): "model", (28,3): "lm_head"}
     special_cases = {(0, 0): "model", (60, 2): "model.layers.61", (60, 3): "model", (60, 4): "lm_head"}
 
     if (segment_id, id_in_segment) in special_cases:
         return special_cases[(segment_id, id_in_segment)]
 
-    # General layer calculation
     layer_idx = segment_id + id_in_segment - 1
     return f"model.layers.{layer_idx}"
 
@@ -275,6 +261,8 @@ def prepare_tensor(tensor, dst_shape, *, force_transpose=False):
         return tensor.T.contiguous()
 
     if tensor.shape == dst_shape:
+        if len(tensor.shape) != 1:
+            logger.warning("attention same shape not transpose !!!")
         return tensor
     if len(tensor.shape) == 2 and paddle.transpose(tensor, perm=[1, 0]).contiguous().shape == dst_shape:
         return paddle.transpose(tensor, perm=[1, 0]).contiguous()
@@ -354,6 +342,9 @@ def load_huggingface_ckpt(model, huggingface_ckpt_path):
                         if len(files) == 1:
                             tensor0 = f.get_tensor(hf_name[0])
                             tensor1 = f.get_tensor(hf_name[1])
+                            target_shape = model.state_dict()[pd_param].shape
+                            prepared_tensor = prepare_tensor([tensor0, tensor1], target_shape)
+                            model.state_dict()[pd_param].set_value(prepared_tensor)
                         else:
                             if weight_map[hf_name[0]] == filename:
                                 tensor0 = f.get_tensor(hf_name[0])
@@ -361,15 +352,18 @@ def load_huggingface_ckpt(model, huggingface_ckpt_path):
                                     ckpt_pre + weight_map[hf_name[1]], framework="paddle", device="cpu"
                                 ) as f_other:
                                     tensor1 = f_other.get_tensor(hf_name[1])
+                                    target_shape = model.state_dict()[pd_param].shape
+                                    prepared_tensor = prepare_tensor([tensor0, tensor1], target_shape)
+                                    model.state_dict()[pd_param].set_value(prepared_tensor)
                             else:
                                 with safe_open(
                                     ckpt_pre + weight_map[hf_name[0]], framework="paddle", device="cpu"
                                 ) as f_other:
                                     tensor0 = f_other.get_tensor(hf_name[0])
-                                tensor1 = f.get_tensor(hf_name[1])
-                        model.state_dict()[pd_param].set_value(
-                            prepare_tensor([tensor0, tensor1], model.state_dict()[pd_param].shape)
-                        )
+                                    tensor1 = f.get_tensor(hf_name[1])
+                                    model.state_dict()[pd_param].set_value(
+                                        prepare_tensor([tensor0, tensor1], model.state_dict()[pd_param].shape)
+                                    )
                     check_list.append(pd_param)
 
         except Exception as e:

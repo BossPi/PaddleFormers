@@ -23,7 +23,7 @@ import paddle
 from parameterized import parameterized
 
 from paddleformers.peft.lora import LoRAConfig, LoRALinear, LoRAModel
-from paddleformers.transformers import AutoModel, BertModel
+from paddleformers.transformers import AutoModel, BertModel, Glm4MoeModel
 
 
 class TestLoraLayer(unittest.TestCase):
@@ -89,7 +89,7 @@ class TestLoraModel(unittest.TestCase):
             enable_lora_list=[None, [True, False]],
             head_dim=2,
         )
-        model = AutoModel.from_pretrained("test_paddleformers/tiny-random-bert")
+        model = AutoModel.from_pretrained("Paddleformers/tiny-random-bert")
         input_ids = paddle.to_tensor(np.random.randint(100, 200, [1, 20]))
         model.eval()
         original_results_1 = model(input_ids)
@@ -114,7 +114,7 @@ class TestLoraModel(unittest.TestCase):
         )
         # turn off plm dropout for to test train vs test
         model = AutoModel.from_pretrained(
-            "test_paddleformers/tiny-random-bert",
+            "Paddleformers/tiny-random-bert",
             hidden_dropout_prob=0,
             attention_probs_dropout_prob=0,
         )
@@ -150,7 +150,7 @@ class TestLoraModel(unittest.TestCase):
                 r=4,
                 lora_alpha=8,
             )
-            model = AutoModel.from_pretrained("test_paddleformers/tiny-random-bert")
+            model = AutoModel.from_pretrained("Paddleformers/tiny-random-bert")
             lora_model = LoRAModel(model, lora_config)
             lora_model.eval()
             original_results = lora_model(input_ids)
@@ -173,9 +173,37 @@ class TestLoraModel(unittest.TestCase):
             lora_alpha=8,
             enable_lora_list=None,
         )
-        model = AutoModel.from_pretrained("test_paddleformers/tiny-random-bert")
+        model = AutoModel.from_pretrained("Paddleformers/tiny-random-bert")
         with self.assertRaises(ValueError):
             LoRAModel(model, lora_config)
+
+
+class TestLoraModelFC(unittest.TestCase):
+    def test_lora_model_save_load_fc(self):
+        with TemporaryDirectory() as tempdir:
+            input_ids = paddle.to_tensor([[0, 345, 232, 328, 740, 140, 1695, 69, 6078, 1588, 2]])
+            lora_config = LoRAConfig(
+                target_modules=[".*q_proj.*", ".*v_proj.*"],
+                r=4,
+                lora_alpha=8,
+            )
+            model = Glm4MoeModel.from_pretrained(
+                "PaddleFormers/tiny-random-glm4moe", download_hub="aistudio", convert_from_hf=True
+            )
+            lora_model = LoRAModel(model, lora_config)
+            lora_model.eval()
+            original_results = lora_model(input_ids)
+            lora_model.save_pretrained(tempdir, is_main_process=True, save_checkpoint_format="flex_checkpoint")
+
+            loaded_lora_model = LoRAModel.from_pretrained(model, tempdir)
+            loaded_lora_model.eval()
+            loaded_results = loaded_lora_model(input_ids)
+            self.assertTrue(paddle.allclose(original_results[0], loaded_results[0]))
+
+            config_loaded_lora_model = LoRAModel.from_pretrained(model, tempdir, lora_config=lora_config)
+            config_loaded_lora_model.eval()
+            config_loaded_results = config_loaded_lora_model(input_ids)
+            self.assertTrue(paddle.allclose(original_results[0], config_loaded_results[0]))
 
 
 class TestLoRAConfig(unittest.TestCase):

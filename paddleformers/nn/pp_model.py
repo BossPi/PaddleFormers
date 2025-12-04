@@ -37,7 +37,7 @@ from .moe.utils import _parse_moe_group
 from .norm import LayerNorm, RMSNorm
 
 
-def parse_args(args, mtp_enable=False):
+def parse_args(args, mtp_enable=False, is_embed=False):
     """
     Parses input arguments and converts them into model-ready format.
     Processes different input argument patterns into standardized hidden states,
@@ -50,6 +50,9 @@ def parse_args(args, mtp_enable=False):
             - Tuple containing 1 element: (hidden_states)
             - Single tensor: hidden_states
             If rope_embeddings are provided, they should be included in the tuple.
+        mtp_enable (bool): Flag for Multi-Token Prediction.
+        is_embed (bool): Flag to indicate if processing is for EmbeddingPipe,
+                                  affects 3-argument tuple parsing.
     Returns:
         Tuple[paddle.Tensor, Optional[paddle.Tensor], Optional[paddle.Tensor]]:
             Returns a tuple containing:
@@ -70,8 +73,12 @@ def parse_args(args, mtp_enable=False):
             if mtp_enable:
                 hidden_states, attention_mask, nbatch_pack_offset = args
                 position_ids = None
-            else:
+            elif is_embed:
                 hidden_states, attention_mask, position_ids = args
+            else:
+                hidden_states, position_ids, position_embeddings = args
+                attention_mask = None
+                nbatch_pack_offset = None
         elif len(args) == 2:
             if mtp_enable:
                 hidden_states, nbatch_pack_offset = args
@@ -201,7 +208,7 @@ class RotaryEmbedding(nn.Layer):
         sinusoid_inp = position_ids.unsqueeze(-1).astype("float32") * indices.unsqueeze(
             0
         )  # [b, s, 1] * [1, d/2] -> [b, s, d/2]
-        emb = paddle.concat((sinusoid_inp, sinusoid_inp), axis=-1)
+        emb = paddle.cat((sinusoid_inp, sinusoid_inp), axis=-1)
         cos = emb.cos()
         sin = emb.sin()
 
@@ -255,7 +262,9 @@ class EmbeddingPipe(nn.Layer):
         num_nextn_predict_layers = self.config.get("num_nextn_predict_layers", 0)
         enable_mtp_magic_send = self.config.get("enable_mtp_magic_send", False)
 
-        input_ids, attention_mask, position_ids, _, nbatch_pack_offset = parse_args(args, num_nextn_predict_layers > 0)
+        input_ids, attention_mask, position_ids, _, nbatch_pack_offset = parse_args(
+            args, num_nextn_predict_layers > 0, is_embed=True
+        )
         input_ids.stop_gradient = True
         emb = self.embed_tokens(input_ids).astype(self.embed_tokens.weight.dtype)
         if position_ids is None and not self.config.fuse_rope:
@@ -266,7 +275,7 @@ class EmbeddingPipe(nn.Layer):
                     dtype="int64",
                 )
                 .unsqueeze(0)
-                .tile(input_ids.shape[0], 1)
+                .tile([input_ids.shape[0], 1])
             )
         if self.config.fuse_rope:
             position_embeddings = None
@@ -289,7 +298,7 @@ class EmbeddingPipe(nn.Layer):
                     inputs_embeds = ScatterOp.apply(inputs_embeds)
                 mtp_emb_res = [inputs_embeds]
                 for depth in range(num_nextn_predict_layers):
-                    inputs_embeds_mtp = paddle.concat(
+                    inputs_embeds_mtp = paddle.cat(
                         [
                             inputs_embeds_ori[:, (depth + 1) :, :],
                             inputs_embeds_extra[:, : (depth + 1), :],
@@ -301,7 +310,7 @@ class EmbeddingPipe(nn.Layer):
                         inputs_embeds_mtp = ScatterOp.apply(inputs_embeds_mtp)
 
                     mtp_emb_res.append(inputs_embeds_mtp)
-                res = paddle.concat(mtp_emb_res)
+                res = paddle.cat(mtp_emb_res)
                 ret = (res,)
         else:
             if self.sequence_parallel:
@@ -425,10 +434,6 @@ def make_decoder_layer_pipe(decoder_layer):
             attn_mask_startend_row_indices = None
             assert len(tgt_mask.shape) == 4, f"Attention mask should be 4D tensor, but got {tgt_mask.shape}."
 
-        position_ids_decoder = None
-        if position_ids is not None:
-            position_ids_decoder = position_ids[:, :max_seq_len]
-
         if position_embeddings is not None:
             position_embeddings = position_embeddings[..., :max_seq_len, :]
             tuple_position_embeddings = (position_embeddings[0], position_embeddings[1])
@@ -443,7 +448,6 @@ def make_decoder_layer_pipe(decoder_layer):
                 hidden_states,
                 attention_mask=tgt_mask,
                 attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-                position_ids=position_ids_decoder,
                 position_embeddings=tuple_position_embeddings,
                 use_reentrant=self.config.recompute_use_reentrant,
             )
@@ -453,7 +457,6 @@ def make_decoder_layer_pipe(decoder_layer):
                 hidden_states=hidden_states,
                 attention_mask=tgt_mask,
                 attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-                position_ids=position_ids_decoder,
                 position_embeddings=tuple_position_embeddings,
             )
 
@@ -473,7 +476,7 @@ def make_decoder_layer_pipe(decoder_layer):
             if enable_mtp_magic_send:
                 ret = (ret,)
             else:
-                ret = (paddle.concat([ret[0], *inputs_embeds]),) + ret[1:]
+                ret = (paddle.cat([ret[0], *inputs_embeds]),) + ret[1:]
 
         return ret
 
@@ -487,18 +490,18 @@ def make_decoder_layer_pipe(decoder_layer):
 class CriterionLayerPipe(CriterionLayer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.return_tuple = False  # loss_func only return loss, no loss_sum
 
     def forward(self, logits, labels):
         if isinstance(labels, tuple) and "sft" in self.loss_type:
             labels, loss_mask = labels
-            loss, loss_sum = super().forward(logits, labels)
-        else:
-            loss = super().forward(logits, labels)
+        loss = super().forward(logits, labels)
         return loss
 
 
 class GeneralModelForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
     _decoder_layer_cls = None
+    _decoder_layer_pipe_cls = None
     _get_tensor_parallel_mappings = None
     _init_weights = None
     _keep_in_fp32_modules = None
@@ -507,12 +510,37 @@ class GeneralModelForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
     transpose_weight_keys = None
     _embed_cls = None
     _rotary_emb_cls = None
+    _norm_cls = "rms_norm"
+    _mtp_layer_pipe_cls = None
+    _embedding_pipe_cls = None
+    _decoder_layer_pipe_cls = None
+    _criterion_pipe_cls = None
+    _lmhead_pipe_cls = None
+    _rms_norm_pipe_cls = None
 
     def __init__(self, config: PretrainedConfig, **kwargs):
+        if getattr(config, "sliding_window", None) is not None and "sliding_attention" in getattr(
+            config, "layer_types", []
+        ):
+            logger.error(
+                "Pipeline Parallelism (PP) does not support sliding window attention. "
+                "To prevent issues during training, please set use_sliding_window=False."
+            )
+
         # dynamic inherit DecoderLayer
         if self._decoder_layer_cls is None:
             raise ValueError("_decoder_layer_cls must be set before init.")
-        DecoderLayerPipe = make_decoder_layer_pipe(self._decoder_layer_cls)
+
+        EmbeddingPipeCls = self._embedding_pipe_cls if self._embedding_pipe_cls is not None else EmbeddingPipe
+
+        if self._decoder_layer_pipe_cls is None:
+            DecoderLayerPipe = make_decoder_layer_pipe(self._decoder_layer_cls)
+        else:
+            DecoderLayerPipe = self._decoder_layer_pipe_cls
+
+        LMHeadPipeCls = self._lmhead_pipe_cls if self._lmhead_pipe_cls is not None else LMHeadPipe
+        MTPLayerPipeCls = self._mtp_layer_pipe_cls if self._mtp_layer_pipe_cls is not None else None
+        RMSNormPipeCls = self._rms_norm_pipe_cls if self._rms_norm_pipe_cls is not None else RMSNormPipe
 
         new_initializer_range = math.sqrt(0.3333 / config.hidden_size)
         logger.info(f"change initializer-range from {config.initializer_range} to {new_initializer_range}")
@@ -559,7 +587,7 @@ class GeneralModelForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
         else:
             self.add_sequential_layer(
                 LayerDesc(
-                    EmbeddingPipe, config=config, embed_cls=self._embed_cls, rotary_emb_cls=self._rotary_emb_cls
+                    EmbeddingPipeCls, config=config, embed_cls=self._embed_cls, rotary_emb_cls=self._rotary_emb_cls
                 ),
                 "model",
             )
@@ -573,16 +601,22 @@ class GeneralModelForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
                 ),
                 f"model.layers.{i}",
             )
+        for i in range(config.num_nextn_predict_layers):
+            if MTPLayerPipeCls is not None:
+                self.add_sequential_layer(
+                    LayerDesc(MTPLayerPipeCls, config=config, layer_idx=config.num_hidden_layers + i),
+                    f"model.layers.{config.num_hidden_layers + i}",
+                )
         for i in range(config.add_tail_layers):
             self.add_sequential_layer(
                 LayerDesc(
                     EmptyLayer,
                 ),
-                f"empty.layers.{i+config.num_hidden_layers}",
+                f"empty.layers.{i + config.num_hidden_layers}",
             )
 
         self.add_sequential_layer(
-            LayerDesc(RMSNormPipe if config.use_rmsnorm else LayerNormPipe, config=config),
+            LayerDesc(RMSNormPipeCls if self._norm_cls == "rms_norm" else LayerNormPipe, config=config),
             "model.norm",
         )
 
@@ -590,14 +624,14 @@ class GeneralModelForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
             self.add_sequential_layer(
                 SharedLayerDesc(
                     "model_shared_weight",
-                    LMHeadPipe,
+                    LMHeadPipeCls,
                     shared_weight_attr="embedding_weight",
                     config=config,
                 ),
                 "lm_head",
             )
         else:
-            self.add_sequential_layer(LayerDesc(LMHeadPipe, config=config), "lm_head")
+            self.add_sequential_layer(LayerDesc(LMHeadPipeCls, config=config), "lm_head")
         recompute_interval = 0
 
         seg_method = config.pp_seg_method if hasattr(config, "pp_seg_method") else "layer:DecoderLayer|EmptyLayer"
@@ -630,10 +664,12 @@ class GeneralModelForCausalLMPipe(PipelinePretrainedModel, PipelineLayer):
         )
 
     def get_loss_fn(self, config):
+        CriterionPipeCls = self._criterion_pipe_cls if self._criterion_pipe_cls is not None else CriterionLayerPipe
+
         if config.get("dpo_config", None) is not None:
-            loss_fn = CriterionLayerPipe(config, use_infohub=True)
+            loss_fn = CriterionPipeCls(config, use_infohub=True)
         else:
-            loss_fn = CriterionLayerPipe(config)
+            loss_fn = CriterionPipeCls(config)
 
         return loss_fn
 

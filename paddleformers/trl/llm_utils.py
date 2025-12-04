@@ -38,10 +38,6 @@ from ..transformers import (  # ChatGLMv2Tokenizer,
     Glm4MoeForCausalLMPipe,
     LlamaForCausalLMPipe,
     PretrainedConfig,
-    Qwen2ForCausalLMPipe,
-    Qwen2MoeForCausalLMPipe,
-    Qwen3ForCausalLMPipe,
-    Qwen3MoeForCausalLMPipe,
 )
 from ..utils.log import logger
 
@@ -114,8 +110,10 @@ def get_lora_target_modules(model):
             ".*mlp.w2.*",
             ".*mlp.c_proj.*",
         ]
-    elif model.config.model_type == "qwen2" or isinstance(model, Qwen2ForCausalLMPipe):
+    elif model.config.model_type == "qwen2":
         target_modules = [
+            ".*qkv_proj.*",
+            ".*up_gate_proj.*",
             ".*q_proj.*",
             ".*k_proj.*",
             ".*v_proj.*",
@@ -124,8 +122,10 @@ def get_lora_target_modules(model):
             ".*down_proj.*",
             ".*up_proj.*",
         ]
-    elif model.config.model_type == "qwen3" or isinstance(model, Qwen3ForCausalLMPipe):
+    elif model.config.model_type == "qwen3":
         target_modules = [
+            ".*qkv_proj.*",
+            ".*up_gate_proj.*",
             ".*q_proj.*",
             ".*k_proj.*",
             ".*v_proj.*",
@@ -156,8 +156,10 @@ def get_lora_target_modules(model):
             ".*w2.*",
             ".*w3.*",
         ]
-    elif model.config.model_type == "qwen2_moe" or isinstance(model, Qwen2MoeForCausalLMPipe):
+    elif model.config.model_type == "qwen2_moe":
         target_modules = [
+            ".*qkv_proj.*",
+            ".*up_gate_proj.*",
             ".*q_proj.*",
             ".*k_proj.*",
             ".*v_proj.*",
@@ -167,7 +169,19 @@ def get_lora_target_modules(model):
             ".*up_proj.*",
             ".*down_proj.*",
         ]
-    elif model.config.model_type == "qwen3_moe" or isinstance(model, Qwen3MoeForCausalLMPipe):
+    elif model.config.model_type == "qwen3_moe":
+        target_modules = [
+            ".*qkv_proj.*",
+            ".*up_gate_proj.*",
+            ".*q_proj.*",
+            ".*k_proj.*",
+            ".*v_proj.*",
+            ".*o_proj.*",
+            ".*gate_proj.*",
+            ".*up_proj.*",
+            ".*down_proj.*",
+        ]
+    elif model.config.model_type == "qwen3_next":
         target_modules = [
             ".*q_proj.*",
             ".*k_proj.*",
@@ -212,8 +226,20 @@ def get_lora_target_modules(model):
             ".*up_proj.*",
             ".*down_proj.*",
         ]
+    elif model.config.model_type == "gemma3_text":
+        target_modules = [
+            ".*q_proj.*",
+            ".*k_proj.*",
+            ".*v_proj.*",
+            ".*o_proj.*",
+            ".*gate_proj.*",
+            ".*up_proj.*",
+            ".*down_proj.*",
+        ]
     elif model.config.model_type == "glm4_moe" or isinstance(model, Glm4MoeForCausalLMPipe):
         target_modules = [
+            ".*qkv_proj.*",
+            ".*up_gate_proj.*",
             ".*q_proj.*",
             ".*k_proj.*",
             ".*v_proj.*",
@@ -224,9 +250,27 @@ def get_lora_target_modules(model):
             ".*mlp.gate_proj.*",
             ".*mlp.up_proj.*",
             ".*mlp.down_proj.*",
-            ".*mlp.gate_proj.*",
-            ".*mlp.up_proj.*",
-            ".*mlp.down_proj.*",
+        ]
+    elif model.config.model_type == "ernie4_5":
+        target_modules = [
+            ".*q_proj.*",
+            ".*k_proj.*",
+            ".*v_proj.*",
+            ".*o_proj.*",
+            ".*up_proj.*",
+            ".*gate_proj.*",
+            ".*down_proj.*",
+            ".*spatial_linear.0.*",
+            ".*spatial_linear.2.*",
+            ".*temporal_linear.0.*",
+            ".*temporal_linear.2.*",
+        ]
+    elif model.config.model_type == "phi3":
+        target_modules = [
+            ".*qkv_proj.*",
+            ".*o_proj.*",
+            ".*gate_up_proj.*",
+            ".*down_proj.*",
         ]
     else:
         raise ValueError(f"Unknown base_model_prefix: {model.config.model_type}.")
@@ -802,7 +846,7 @@ def get_rotary_position_embedding(position_ids, head_dim, rope_theta=10000.0, ro
     # shape: [B, S, D/2]
     freqs = paddle.einsum("ij,k->ijk", position_ids.cast("float32"), inv_freq)
     # shape: [B, S, 1, D]
-    emb = paddle.concat([freqs, freqs], axis=-1).reshape((bsz, max_seq_len, 1, head_dim))
+    emb = paddle.cat([freqs, freqs], axis=-1).reshape((bsz, max_seq_len, 1, head_dim))
 
     rot_emb[0] = paddle.cos(emb)
     rot_emb[1] = paddle.sin(emb)

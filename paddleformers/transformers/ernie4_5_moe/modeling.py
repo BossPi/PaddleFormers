@@ -39,16 +39,19 @@ from ...nn.embedding import Embedding as GeneralEmbedding
 from ...nn.linear import Linear as GeneralLinear
 from ...nn.lm_head import LMHead as GeneralLMHead
 from ...nn.mlp import MLP as Ernie4_5MLP
-from ...nn.moe.moe_alltoall_layer import MOEAlltoAllLayer
+from ...nn.moe.moe_allgather_layer import MOEAllGatherLayerV2
 from ...nn.moe.moe_block import MoEStatics
 from ...nn.moe.topk_gate import TopKGate
 from ...nn.moe.utils import _parse_moe_group
 from ...nn.norm import Norm as GeneralNorm
 from ...nn.pp_model import GeneralModelForCausalLMPipe
 from ...utils.log import logger
+from ..cache_utils import Cache, DynamicCache
 from ..ernie4_5.modeling import Ernie4_5Attention
+from ..masking_utils import create_causal_mask_and_row_indices
 from ..model_outputs import MoECausalLMOutputWithPast, MoECausalLMOutputWithPastAndMTP
 from ..model_utils import PretrainedModel, register_base_model
+from ..modeling_rope_utils import dynamic_rope_update
 from ..tensor_parallel_utils import model_parallel_dropout
 from .configuration import Ernie4_5_MoeConfig
 
@@ -89,10 +92,15 @@ def mtp_hidden_states_set_zero(hidden_states, inbatch_pack_offset):
 class Ernie4_5_MoeRotaryEmbedding(nn.Layer):
     def __init__(self, config):
         super().__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
         self.config = config
         self.head_dim = config.head_dim
         self.base = config.rope_theta
+        rope_parameters = config.rope_parameters
+        self.rope_type = rope_parameters.get("rope_type", rope_parameters.get("type", "default"))
 
+    @dynamic_rope_update
     def forward(self, x, position_ids):
         """
         Compute rotary position embeddings for given sequence length.
@@ -110,7 +118,7 @@ class Ernie4_5_MoeRotaryEmbedding(nn.Layer):
         sinusoid_inp = position_ids.unsqueeze(-1).astype("float32") * indices.unsqueeze(
             0
         )  # [b, s, 1] * [1, d/2] -> [b, s, d/2]
-        emb = paddle.concat((sinusoid_inp, sinusoid_inp), axis=-1)
+        emb = paddle.cat((sinusoid_inp, sinusoid_inp), axis=-1)
         cos = emb.cos()
         sin = emb.sin()
 
@@ -214,7 +222,7 @@ class FakeMoERouterLoss(PyLayer):
         return out_grad, paddle.full(ctx.loss_shape, router_loss_grad_value, dtype=ctx.loss_dtype)
 
 
-class Ernie4_5_MoeSparseMoeBlock(MOEAlltoAllLayer):
+class Ernie4_5_MoeSparseMoeBlock(MOEAllGatherLayerV2):
     def __init__(self, config, layer_idx):
         # correction bias (yes it seems to be a typo with statics <> statistics)
         moe_num_experts = config.moe_num_experts
@@ -232,7 +240,7 @@ class Ernie4_5_MoeSparseMoeBlock(MOEAlltoAllLayer):
             f"using moe-world-size: {config.moe_world_size} expert-per-device:{moe_num_experts_per_device}, moe_group={config.moe_group}"
         )
 
-        moe_statics = MoEStatics(config, layer_idx)
+        moe_statics = MoEStatics(config, layer_idx) if config.moe_use_aux_free else None
         experts = nn.LayerList([])
         moe_rank = paddle.distributed.get_rank(config.moe_group)
 
@@ -258,7 +266,8 @@ class Ernie4_5_MoeSparseMoeBlock(MOEAlltoAllLayer):
             shared_experts = Ernie4_5_MoeMLP(
                 deepcopy(config), config.hidden_size, config.moe_intermediate_size * config.moe_num_shared_experts
             )
-
+        use_expert_out_alltoall = use_expert_out_alltoall = "alltoall" in config.moe_multimodal_dispatch_use_allgather
+        use_padding = "unpad" not in config.moe_multimodal_dispatch_use_allgather
         super().__init__(
             gate=gate,
             experts=experts,
@@ -271,6 +280,9 @@ class Ernie4_5_MoeSparseMoeBlock(MOEAlltoAllLayer):
             group_experts=config.moe_group_experts,
             moe_statics=moe_statics,
             moe_num_experts=config.moe_num_experts,
+            use_expert_out_alltoall=use_expert_out_alltoall,
+            use_padding=use_padding,
+            dense_token_type=3,
         )
         self.norm_min = config.moe_norm_min
         self.num_experts = config.moe_num_experts
@@ -317,6 +329,7 @@ class Ernie4_5_MoeDecoderLayer(nn.Layer):
             hidden_size=config.hidden_size,
             has_bias=config.use_bias,
             norm_eps=self.config.rms_norm_eps,
+            input_is_parallel=config.sequence_parallel,
         )
         self.post_attention_layernorm = GeneralNorm.create(
             config=config,
@@ -324,12 +337,12 @@ class Ernie4_5_MoeDecoderLayer(nn.Layer):
             hidden_size=config.hidden_size,
             has_bias=config.use_bias,
             norm_eps=self.config.rms_norm_eps,
+            input_is_parallel=config.sequence_parallel,
         )
 
         self.hidden_dropout = nn.Dropout(p=config.hidden_dropout_prob, mode="upscale_in_train")
 
         if config.sequence_parallel:
-            self.post_attention_layernorm.enable_sequence_parallel()
             # There is no Column/RowLinear in bias and expert in mp-moe. No hook is needed.
             if not hasattr(config, "disable_ffn_model_parallel"):
                 self.input_layernorm.enable_sequence_parallel()
@@ -349,7 +362,7 @@ class Ernie4_5_MoeDecoderLayer(nn.Layer):
         position_ids: Optional[paddle.Tensor] = None,
         position_embeddings: Optional[Tuple[paddle.Tensor]] = None,
         output_attentions: Optional[bool] = False,
-        past_key_value: Optional[Tuple[paddle.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         output_gate_logits=False,  # PP model should not output gate logits,
     ) -> Tuple[paddle.Tensor, Optional[Tuple[paddle.Tensor, paddle.Tensor]]]:
@@ -361,7 +374,7 @@ class Ernie4_5_MoeDecoderLayer(nn.Layer):
             attn_mask_startend_row_indices (Optional[paddle.Tensor]): Indices for variable length attention
             position_ids (Optional[paddle.Tensor]): Position indices for rotary embeddings
             output_attentions (Optional[bool]): Whether to return attention weights
-            past_key_value (Optional[Tuple[paddle.Tensor]]): Cached key/value states
+            past_key_values (Optional[Cache]): Cached key/value states
             use_cache (Optional[bool]): Whether to cache key/value states
             output_gate_logits (bool): Whether to return MoE gate logits
 
@@ -376,9 +389,9 @@ class Ernie4_5_MoeDecoderLayer(nn.Layer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        (hidden_states, self_attn_weights, present_key_value, *router_loss_attn) = self.self_attn(
+        (hidden_states, self_attn_weights, *router_loss_attn) = self.self_attn(
             hidden_states=hidden_states,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             attention_mask=attention_mask,
             attn_mask_startend_row_indices=attn_mask_startend_row_indices,
             position_embeddings=position_embeddings,
@@ -406,9 +419,6 @@ class Ernie4_5_MoeDecoderLayer(nn.Layer):
 
         if output_attentions:
             outputs += (self_attn_weights,)
-
-        if not self.training and use_cache:
-            outputs += (present_key_value,)
 
         # Non-empty only if `use_moe`
         if router_loss_attn:
@@ -452,7 +462,7 @@ class Ernie4_5_MoePretrainedModel(PretrainedModel):
         "up_proj",
         "down_proj",
         "gate",
-        "mtp_linear_proj.0",
+        "mtp_linear_proj\.\d+",
     ]
 
     @classmethod
@@ -522,7 +532,10 @@ class Ernie4_5_MoePretrainedModel(PretrainedModel):
                 # bias
                 if config.use_bias:
                     actions.update(
-                        {f"{cls.base_model_prefix}.layers.0.{b}": partial(fn, is_column=True) for b in BIAS_KEYS}
+                        {
+                            f"{cls.base_model_prefix}.layers.{layer_idx}.{b}": partial(fn, is_column=True)
+                            for b in BIAS_KEYS
+                        }
                     )
             # MTP block
             if config.num_nextn_predict_layers > 0:
@@ -629,6 +642,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
             hidden_size=config.hidden_size,
             has_bias=config.use_bias,
             norm_eps=self.config.rms_norm_eps,
+            input_is_parallel=config.sequence_parallel,
         )
 
         self.rotary_emb = Ernie4_5_MoeRotaryEmbedding(config)
@@ -649,6 +663,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                         hidden_size=config.hidden_size,
                         has_bias=config.use_bias,
                         norm_eps=self.config.rms_norm_eps,
+                        input_is_parallel=config.sequence_parallel,
                     )
                     for _ in range(self.config.num_nextn_predict_layers)
                 ]
@@ -661,6 +676,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                         hidden_size=config.hidden_size,
                         has_bias=config.use_bias,
                         norm_eps=self.config.rms_norm_eps,
+                        input_is_parallel=config.sequence_parallel,
                     )
                     for _ in range(self.config.num_nextn_predict_layers)
                 ]
@@ -694,8 +710,9 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
         attention_mask,
         attn_mask_startend_row_indices,
         position_ids,
+        position_embeddings,
         output_attentions,
-        past_key_value,
+        past_key_values,
         use_cache,
     ):
         """Perform gradient checkpointing for memory-efficient training.
@@ -707,7 +724,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
             attn_mask_startend_row_indices (paddle.Tensor): Variable length indices
             position_ids (paddle.Tensor): Position indices
             output_attentions (bool): Whether to output attention weights
-            past_key_value (Optional[Tuple[paddle.Tensor]]): Cached key/value states
+            past_key_values (Optional[Cache]): Cached key/value states
             use_cache (bool): Whether to cache key/value states
 
         Returns:
@@ -726,8 +743,9 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
             attention_mask,
             attn_mask_startend_row_indices,
             position_ids,
+            position_embeddings,
             output_attentions,
-            past_key_value,
+            past_key_values,
             use_cache,
         )
         return hidden_states
@@ -755,7 +773,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
             attn_mask_startend_row_indices (Optional[paddle.Tensor]): Variable length attention indices
             inputs_embeds (Optional[paddle.Tensor]): Precomputed embeddings
             use_cache (Optional[bool]): Whether to cache key/value states
-            past_key_values (Optional[Tuple[Tuple[paddle.Tensor]]]): Cached key/value states
+            past_key_values (Optional[Cache]): Cached key/value states
             output_attentions (Optional[bool]): Whether to output attention weights
             output_hidden_states (Optional[bool]): Whether to output all hidden states
             return_dict (Optional[bool]): Whether to return dict or tuple
@@ -787,12 +805,11 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
             bsz, seq_length, _ = inputs_embeds.shape
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+        full_seq_length = seq_length
 
-        if past_key_values is None:
-            past_key_values = tuple([None] * len(self.layers))
-            kv_seq_len = 0
-        else:
-            kv_seq_len = past_key_values[0][0].shape[1]
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+        kv_seq_len = past_key_values.get_seq_length() if past_key_values is not None else 0
 
         if position_ids is None:
             position_ids = paddle.arange(kv_seq_len, seq_length).unsqueeze(0).tile((bsz, 1))
@@ -802,10 +819,18 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if attention_mask is not None:
-            attention_mask = self._prepare_decoder_attention_mask(
-                attention_mask, inputs_embeds.shape[:2], kv_seq_len, inputs_embeds.dtype
-            )
+        mask_kwargs = {
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "batch_size": bsz,
+            "seq_length": full_seq_length,
+            "cache_length": kv_seq_len,
+            "attention_mask": attention_mask,
+            "attn_mask_startend_row_indices": attn_mask_startend_row_indices,
+            "prepare_decoder_attention_mask": self._prepare_decoder_attention_mask,
+        }
+
+        attention_mask, attn_mask_startend_row_indices = create_causal_mask_and_row_indices(**mask_kwargs)
 
         if self.training and self.config.num_nextn_predict_layers > 0:
             inputs_embeds_extra = inputs_embeds[:, -self.config.num_nextn_predict_layers :, :]
@@ -857,7 +882,6 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        next_decoder_cache = () if use_cache else None
         all_router_loss = 0.0
         all_gate_logits = ()
         mtp_outputs = []
@@ -866,7 +890,6 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
             has_gradient = not hidden_states.stop_gradient
             if self.config.recompute and self.config.recompute_granularity == "full" and has_gradient:
                 layer_outputs = self.recompute_training(
@@ -877,7 +900,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                     position_ids,
                     position_embeddings,
                     output_attentions,
-                    past_key_value,
+                    past_key_values,
                     use_cache,
                 )
             else:
@@ -888,7 +911,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                     position_ids,
                     position_embeddings,
                     output_attentions,
-                    past_key_value,
+                    past_key_values,
                     use_cache,
                 )
 
@@ -896,9 +919,6 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                 hidden_states = layer_outputs[0]
             else:
                 hidden_states = layer_outputs
-
-            if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -916,7 +936,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                     hidden_states = GatherOp.apply(hidden_states)
                     hidden_states = hidden_states.reshape([-1, seq_length, hidden_states.shape[-1]])
 
-                inputs_embeds_cur_depth = paddle.concat(
+                inputs_embeds_cur_depth = paddle.cat(
                     [
                         inputs_embeds_ori[:, (depth + 1) :, :],
                         inputs_embeds_extra[:, : (depth + 1), :],
@@ -934,7 +954,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                     ]
 
                 if attn_mask_startend_row_indices is not None:
-                    attn_mask_startend_row_indices = paddle.concat(
+                    attn_mask_startend_row_indices = paddle.cat(
                         [
                             attn_mask_startend_row_indices_ori[:, :, (depth + 1) :],
                             attn_mask_startend_row_indices_extra[:, :, : (depth + 1)],
@@ -942,7 +962,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                         axis=-1,
                     )
                 if position_ids is not None:
-                    position_ids = paddle.concat(
+                    position_ids = paddle.cat(
                         [
                             position_ids_ori[:, (depth + 1) :],
                             position_ids_extra[:, : (depth + 1)],
@@ -950,7 +970,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                         axis=1,
                     )
 
-                nbatch_pack_offset_cur_depth = paddle.concat(
+                nbatch_pack_offset_cur_depth = paddle.cat(
                     [
                         nbatch_pack_offset_ori[:, (depth + 1) :],
                         nbatch_pack_offset_extra[:, : (depth + 1)],
@@ -964,7 +984,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                 hidden_states_norm = self.mtp_hidden_norm[depth](hidden_states)
 
                 inputs_embeds_cur_depth = self.mtp_linear_proj[depth](
-                    paddle.concat([inputs_embeds_cur_depth_norm, hidden_states_norm], axis=-1)
+                    paddle.cat([inputs_embeds_cur_depth_norm, hidden_states_norm], axis=-1)
                 )
 
                 if self.config.sequence_parallel:
@@ -972,14 +992,14 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
                     inputs_embeds_cur_depth = ScatterOp.apply(inputs_embeds_cur_depth)
 
                 decoder_layer = self.mtp_block[depth]
-                past_key_value = None
+                past_key_values = None
                 layer_outputs = decoder_layer(
                     inputs_embeds_cur_depth,
                     attention_mask,
                     attn_mask_startend_row_indices,
                     position_ids,
                     output_attentions,
-                    past_key_value,
+                    past_key_values,
                     use_cache,
                 )
                 if isinstance(layer_outputs, (tuple, list)):
@@ -1004,14 +1024,12 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
-
         if not return_dict:
             return tuple(
                 v
                 for v in [
                     hidden_states,
-                    next_cache,
+                    past_key_values,
                     all_hidden_states,
                     all_self_attns,
                     all_router_loss,
@@ -1024,7 +1042,7 @@ class Ernie4_5_MoeModel(Ernie4_5_MoePretrainedModel):
         # assert all_router_loss is None, f'moe not support `return-dict`'
         return MoECausalLMOutputWithPastAndMTP(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_loss=all_router_loss,
@@ -1092,7 +1110,7 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_MoePretrainedModel):
             labels (paddle.Tensor): Target labels.
             loss_mask (paddle.Tensor): Loss mask.
             use_cache (bool): Whether to use cached hidden states.
-            past_key_values (dict): Pre-computed hidden states.
+            past_key_values (Cache): Pre-computed hidden states.
             output_attentions (bool): Whether to output attentions.
             output_hidden_states (bool): Whether to output hidden states.
             return_dict (bool): Whether to return a dictionary.

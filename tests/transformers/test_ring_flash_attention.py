@@ -17,7 +17,7 @@ import unittest
 
 import numpy as np
 import paddle
-from paddle.nn.functional.flash_attention import scaled_dot_product_attention
+from paddle.nn.functional import scaled_dot_product_attention
 
 from paddleformers.transformers.ring_flash_attention import (
     RingFlashAttention,
@@ -53,7 +53,7 @@ class TestRingFlashAttention(unittest.TestCase):
     def split_belanced_data(self, input):
         sliced_datas = paddle.split(input, num_or_sections=self.degree * 2, axis=1)
         sliced_data0, sliced_data1 = sliced_datas[self.rank], sliced_datas[self.degree * 2 - 1 - self.rank]
-        return paddle.concat([sliced_data0, sliced_data1], axis=1).detach()
+        return paddle.cat([sliced_data0, sliced_data1], axis=1).detach()
 
     def single_test(self, bsz, seq_len_per_device, head_num, head_dim, is_causal, use_mask):
         if self.degree < 2:
@@ -75,7 +75,7 @@ class TestRingFlashAttention(unittest.TestCase):
             attn_mask = paddle.ones(mask_shape).to(query.dtype)
             attn_mask_list = paddle.split(attn_mask, axis=2, num_or_sections=self.degree * 2)
             first_chunk_id, second_chunk_id = get_chunk_id(self.rank, self.degree)
-            local_attn_mask = paddle.concat([attn_mask_list[first_chunk_id], attn_mask_list[second_chunk_id]], axis=2)
+            local_attn_mask = paddle.cat([attn_mask_list[first_chunk_id], attn_mask_list[second_chunk_id]], axis=2)
         else:
             attn_mask = None
             local_attn_mask = None
@@ -84,7 +84,9 @@ class TestRingFlashAttention(unittest.TestCase):
             local_out = RingFlashAttention.apply(
                 local_query, local_key, local_value, self.group, is_causal=is_causal, attn_mask=local_attn_mask
             )
-            ref_out = scaled_dot_product_attention(query, key, value, is_causal=is_causal, attn_mask=attn_mask)
+            ref_out = scaled_dot_product_attention(
+                query, key, value, is_causal=is_causal, attn_mask=attn_mask, enable_gqa=True
+            )
 
         local_out.backward()
         ref_out.backward()
