@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from functools import partial
 from typing import Optional, Tuple, Union
 
 import paddle
@@ -36,7 +35,7 @@ from ...nn.lm_head import LMHead as GeneralLMHead
 from ...nn.mlp import MLP
 from ...nn.moe_deepep.moe_factory import QuickAccessMoEFactory
 from ...nn.norm import Norm as GeneralNorm
-from ...nn.pp_model import GeneralModelForCausalLMPipe
+from ...nn.pp_model import CriterionLayerPipe, GeneralModelForCausalLMPipe
 from ...utils.log import logger
 from ..cache_utils import Cache, DynamicCache
 from ..gpt_provider import GPTModelProvider
@@ -90,6 +89,8 @@ class Qwen3MoEModelProvider(GPTModelProvider):
     moe_grouped_gemm: bool = True
 
     n_shared_experts: int = 0
+
+    use_qk_norm: bool = True
 
 
 def rotate_half(x):
@@ -744,110 +745,6 @@ class Qwen3MoePretrainedModel(PretrainedModel):
     ]
 
     @classmethod
-    def _get_tensor_parallel_mappings(cls, config: Qwen3MoeConfig, is_split=True):
-        """Generate tensor parallel mappings for model conversion."""
-        from ..conversion_utils import split_or_merge_func
-
-        fn = split_or_merge_func(
-            is_split=is_split,
-            tensor_model_parallel_size=config.tensor_model_parallel_size,
-            tensor_parallel_rank=config.tensor_parallel_rank,
-            num_attention_heads=config.num_attention_heads,
-        )
-
-        LAYER_COLWISE = [
-            "self_attn.q_proj.weight",
-            "self_attn.k_proj.weight",
-            "self_attn.v_proj.weight",
-        ]
-
-        LAYER_ROWWISE = ["self_attn.o_proj.weight"]
-
-        EXPERT_LAYER_COLWISE = [
-            "up_proj.weight",
-            "gate_proj.weight",
-        ]
-
-        EXPERT_LAYER_ROWWISE = ["down_proj.weight"]
-
-        BIAS_KEYS = [
-            "self_attn.q_proj.bias",
-            "self_attn.k_proj.bias",
-            "self_attn.v_proj.bias",
-        ]
-
-        def make_base_actions():
-            actions = {
-                "lm_head.weight": partial(fn, is_column=False),
-                "embed_tokens.weight": partial(fn, is_column=False),
-            }
-            for layer_idx in range(config.num_hidden_layers):
-                actions.update(
-                    {
-                        f"{cls.base_model_prefix}.layers.{layer_idx}.{k}": partial(fn, is_column=True)
-                        for k in LAYER_COLWISE
-                    }
-                )
-                actions.update(
-                    {
-                        f"{cls.base_model_prefix}.layers.{layer_idx}.{k}": partial(fn, is_column=False)
-                        for k in LAYER_ROWWISE
-                    }
-                )
-                try:
-                    moe_group = fleet.get_hybrid_communicate_group().get_expert_parallel_group()
-                except Exception:
-                    moe_group = None
-                expert_model_parallel_size = dist.get_world_size(moe_group) if moe_group is not None else 1
-                # TODO: merge disable_ffn_model_parallel and expert_model_parallel_size
-                if expert_model_parallel_size <= 1:
-                    # # if disable_ffn_model_parallel is True, disable expert layer tp plan
-                    # if not config.disable_ffn_model_parallel:
-                    actions.update(
-                        {
-                            f"{cls.base_model_prefix}.layers.{layer_idx}.mlp.experts.{e}.{k}": partial(
-                                fn, is_column=True
-                            )
-                            for e in range(config.num_experts)
-                            for k in EXPERT_LAYER_COLWISE
-                        }
-                    )
-                    actions.update(
-                        {
-                            f"{cls.base_model_prefix}.layers.{layer_idx}.mlp.experts.{e}.{k}": partial(
-                                fn, is_column=False
-                            )
-                            for e in range(config.num_experts)
-                            for k in EXPERT_LAYER_ROWWISE
-                        }
-                    )
-                actions.update(
-                    {
-                        f"{cls.base_model_prefix}.layers.{layer_idx}.mlp.{k}": partial(fn, is_column=False)
-                        for k in EXPERT_LAYER_ROWWISE
-                    }
-                )
-                actions.update(
-                    {
-                        f"{cls.base_model_prefix}.layers.{layer_idx}.mlp.{k}": partial(fn, is_column=True)
-                        for k in EXPERT_LAYER_COLWISE
-                    }
-                )
-
-                # bias
-                if config.attention_bias:
-                    actions.update(
-                        {
-                            f"{cls.base_model_prefix}.layers.{layer_idx}.{b}": partial(fn, is_column=True)
-                            for b in BIAS_KEYS
-                        }
-                    )
-            return actions
-
-        mappings = make_base_actions()
-        return mappings
-
-    @classmethod
     def _gen_aoa_config(cls, config: Qwen3MoeConfig):
         if hasattr(config, "n_routed_experts"):
             num_experts = config.n_routed_experts
@@ -1307,10 +1204,11 @@ def load_balancing_loss_func(gate_logits, num_experts, top_k=2, attention_mask=N
     return overall_loss * num_experts
 
 
-class Qwen3MoeForCausalLMFleet(Qwen3MoePretrainedModel):
+class Qwen3MoeForCausalLM(Qwen3MoePretrainedModel):
     is_fleet = True
 
     def __new__(cls, config):
+        # Hybrid parallel config convert.
         config.tensor_model_parallel_size = max(config.tensor_model_parallel_size, 1)
         config.context_parallel_size = max(config.context_parallel_size, 1)
         config.pipeline_model_parallel_size = max(config.pipeline_model_parallel_size, 1)
@@ -1319,16 +1217,20 @@ class Qwen3MoeForCausalLMFleet(Qwen3MoePretrainedModel):
 
         model_provider_class = Qwen3MoEModelProvider
         model_provider = model_provider_class.from_config(config)
-        gpt_model = model_provider.provide()
+        loss_fn = None
+        if hasattr(config, "dpo_config"):
+            loss_fn = CriterionLayerPipe(config, use_infohub=True)
+        gpt_model = model_provider.provide(loss_fn=loss_fn)
         gpt_model._gen_aoa_config = cls._gen_aoa_config
         gpt_model._gen_inv_aoa_config = cls._gen_inv_aoa_config
         gpt_model._get_tensor_parallel_mappings = cls._get_tensor_parallel_mappings
         gpt_model.config_to_save = config
+        gpt_model.is_fleet = cls.is_fleet
 
         return gpt_model
 
 
-class Qwen3MoeForCausalLM(Qwen3MoePretrainedModel):
+class Qwen3MoeForCausalLMDecapitated(Qwen3MoePretrainedModel):
     enable_to_static_method = True
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -1456,21 +1358,32 @@ class Qwen3MoeForCausalLM(Qwen3MoePretrainedModel):
         )
 
 
-class Qwen3MoeForCausalLMPipeFleet(Qwen3MoePretrainedModel, GeneralModelForCausalLMPipe):
+class Qwen3MoeForCausalLMPipe(Qwen3MoePretrainedModel, GeneralModelForCausalLMPipe):
     is_fleet = True
 
     def __new__(cls, config):
+        # Hybrid parallel config convert.
+        config.tensor_model_parallel_size = max(config.tensor_model_parallel_size, 1)
+        config.context_parallel_size = max(config.context_parallel_size, 1)
+        config.pipeline_model_parallel_size = max(config.pipeline_model_parallel_size, 1)
+        config.virtual_pipeline_model_parallel_size = max(config.virtual_pipeline_model_parallel_size, 1)
+        config.expert_model_parallel_size = max(config.expert_model_parallel_size, 1)
+
         model_provider_class = Qwen3MoEModelProvider
         model_provider = model_provider_class.from_config(config)
-        gpt_model = model_provider.provide()
+        loss_fn = None
+        if hasattr(config, "dpo_config"):
+            loss_fn = CriterionLayerPipe(config, use_infohub=True)
+        gpt_model = model_provider.provide(loss_fn=loss_fn)
         gpt_model._gen_aoa_config = cls._gen_aoa_config
         gpt_model._gen_inv_aoa_config = cls._gen_inv_aoa_config
         gpt_model._get_tensor_parallel_mappings = cls._get_tensor_parallel_mappings
         gpt_model.config_to_save = config
+        gpt_model.is_fleet = cls.is_fleet
         return gpt_model
 
 
-class Qwen3MoeForCausalLMPipe(GeneralModelForCausalLMPipe):
+class Qwen3MoeForCausalLMPipeDecapitated(GeneralModelForCausalLMPipe):
     config_class = Qwen3MoeConfig
     _decoder_layer_cls = Qwen3MoeDecoderLayer
     _get_tensor_parallel_mappings = Qwen3MoeModel._get_tensor_parallel_mappings
@@ -1487,7 +1400,7 @@ __all__ = [
     "Qwen3MoeModel",
     "Qwen3MoePretrainedModel",
     "Qwen3MoeForCausalLM",
-    "Qwen3MoeForCausalLMFleet",
+    "Qwen3MoeForCausalLMDecapitated",
     "Qwen3MoeForCausalLMPipe",
-    "Qwen3MoeForCausalLMPipeFleet",
+    "Qwen3MoeForCausalLMPipeDecapitated",
 ]
